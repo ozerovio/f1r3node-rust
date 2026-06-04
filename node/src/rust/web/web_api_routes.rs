@@ -142,9 +142,20 @@ pub async fn last_finalized_block_handler(
         Some("summary") => ViewMode::Summary,
         _ => ViewMode::Full,
     };
-    match app_state.web_api.last_finalized_block(view).await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => AppError(e).into_response(),
+    let web_api = app_state.web_api.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(async move {
+            web_api.last_finalized_block(view).await
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(e)) => AppError(e).into_response(),
+        Err(e) => {
+            AppError(eyre::eyre!("last_finalized_block task panicked: {}", e)).into_response()
+        }
     }
 }
 
