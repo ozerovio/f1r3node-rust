@@ -58,7 +58,7 @@ impl Routes {
             .layer(cors)
     }
 
-    pub fn create_admin_routes() -> Router<AppState> {
+    pub fn create_admin_routes(http_max_body_bytes: usize) -> Router<AppState> {
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -72,6 +72,7 @@ impl Routes {
             .nest("/api", admin_routes.merge(reporting_routes))
             .nest("/api/v1", WebApiRoutesV1::create_admin_router())
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", AdminApi::openapi()))
+            .layer(DefaultBodyLimit::max(http_max_body_bytes))
             .layer(cors)
     }
 }
