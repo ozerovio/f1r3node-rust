@@ -6,6 +6,8 @@ use std::mem;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use crypto::rust::signatures::secp256k1::Secp256k1;
+use crypto::rust::signatures::signatures_alg::SignaturesAlg;
 use crypto::rust::hash::blake2b512_random::Blake2b512Random;
 use crypto::rust::public_key::PublicKey;
 use crypto::rust::signatures::signed::Signed;
@@ -65,6 +67,7 @@ use crate::rust::util::rholang::system_deploy_user_error::{
 use crate::rust::util::rholang::tools::Tools;
 use crate::rust::util::rholang::{interpreter_util, system_deploy_util};
 use crate::rust::util::{construct_deploy, event_converter};
+
 
 pub struct RuntimeOps {
     pub runtime: RhoRuntimeImpl,
@@ -898,7 +901,7 @@ impl RuntimeOps {
                 // Hardcoded phlogiston limit / 1 REV if phloPrice=1
                 Some(100 * 1000 * 1000),
                 None,
-                Some(construct_deploy::DEFAULT_SEC.clone()),
+                Some(Secp256k1.new_key_pair().0),
                 None,
                 None,
             )?;
