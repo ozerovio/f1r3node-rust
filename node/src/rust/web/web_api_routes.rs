@@ -430,7 +430,7 @@ pub async fn estimate_cost_handler(
 ) -> Response {
     match app_state
         .web_api
-        .estimate_cost(request.term, query.block_hash)
+        .estimate_cost(request.term, query.block_hash, request.deployer)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -651,6 +651,7 @@ mod tests {
         async fn estimate_cost(
             &self,
             _: String,
+            _: Option<String>,
             _: Option<String>,
         ) -> eyre::Result<crate::rust::api::web_api::EstimateCostResponse> {
             unimplemented!()

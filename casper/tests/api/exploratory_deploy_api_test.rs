@@ -141,6 +141,7 @@ async fn exploratory_deploy_should_get_data_from_read_only_node() {
         None,  // block_hash: None means use current DAG tips
         false, // use_pre_state_hash
         false, // dev_mode
+        None,  // deployer
     )
     .await;
 
@@ -249,6 +250,7 @@ async fn exploratory_deploy_should_return_error_on_bonded_validator() {
         None,  // block_hash
         false, // use_pre_state_hash
         false, // dev_mode: false means read-only check is enforced
+        None,  // deployer
     )
     .await;
 
@@ -269,3 +271,4 @@ async fn exploratory_deploy_should_return_error_on_bonded_validator() {
         }
     }
 }
+
