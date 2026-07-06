@@ -761,12 +761,10 @@ impl DeployService for DeployGrpcServiceV1Impl {
         };
         let deployer = if request.deployer.is_empty() {
             None
-        } else if request.deployer.len() != 65 {
-            return Err(tonic::Status::invalid_argument(format!(
-                "Invalid deployer public key: expected 65 bytes (uncompressed secp256k1), got {}",
-                request.deployer.len()
-            )));
         } else {
+            PublicKey::validate_secp256k1_bytes(&request.deployer).map_err(|e| {
+                tonic::Status::invalid_argument(format!("Invalid deployer public key: {}", e))
+            })?;
             Some(PublicKey::from_bytes(&request.deployer))
         };
 
