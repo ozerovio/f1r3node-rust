@@ -14,6 +14,7 @@ use casper::rust::engine::engine_cell::EngineCell;
 use casper::rust::ProposeFunction;
 use comm::rust::discovery::node_discovery::NodeDiscovery;
 use comm::rust::rp::connect::ConnectionsCell;
+use crypto::rust::public_key::PublicKey;
 use graphz::{GraphSerializer, ListSerializer};
 use models::casper::v1::deploy_service_server::DeployService;
 use models::casper::v1::{
@@ -758,6 +759,16 @@ impl DeployService for DeployGrpcServiceV1Impl {
         } else {
             Some(request.block_hash.clone())
         };
+        let deployer = if request.deployer.is_empty() {
+            None
+        } else if request.deployer.len() != 65 {
+            return Err(tonic::Status::invalid_argument(format!(
+                "Invalid deployer public key: expected 65 bytes (uncompressed secp256k1), got {}",
+                request.deployer.len()
+            )));
+        } else {
+            Some(PublicKey::from_bytes(&request.deployer))
+        };
 
         match BlockAPI::exploratory_deploy(
             &self.engine_cell,
@@ -765,7 +776,7 @@ impl DeployService for DeployGrpcServiceV1Impl {
             block_hash,
             request.use_pre_state_hash,
             self.dev_mode,
-            None,
+            deployer,
         )
         .await
         {
