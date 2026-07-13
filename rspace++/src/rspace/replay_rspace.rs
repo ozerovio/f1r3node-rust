@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde::Serialize;
 
 use super::checkpoint::SoftCheckpoint;
@@ -54,8 +53,8 @@ pub struct ReplayRSpace<C, P, A, K> {
     pub replay_data: Arc<Mutex<MultisetMultiMap<IOEvent, COMM>>>,
     logger: Arc<Mutex<Box<dyn RSpaceLogger<C, P, A, K>>>>,
     replay_waiting_continuations_estimate: Arc<AtomicI64>,
-    phase_a_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
-    phase_b_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    phase_a_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
+    phase_b_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>
 }
 
 impl<C, P, A, K> ReplayRSpace<C, P, A, K>
@@ -86,27 +85,29 @@ where
     }
 
     async fn acquire_locks(
-        lock_map: &DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
+        stripes: &[Arc<tokio::sync::Mutex<()>>],
         keys: &[u64],
     ) -> ChannelLockGuard {
-        let mut sorted_keys: Vec<u64> = keys.to_vec();
-        sorted_keys.sort();
-        sorted_keys.dedup();
-
-        let mut held: Vec<HeldLock> = Vec::with_capacity(sorted_keys.len());
-        for k in &sorted_keys {
-            let lock = lock_map
-                .entry(*k)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone();
-            let guard = lock.clone().lock_owned().await;
+        let mut indices: Vec<usize> = keys.iter().map(|k| (*k as usize) % stripes.len()).collect();
+            indices.sort();
+            indices.dedup();
+        let mut held: Vec<HeldLock> = Vec::with_capacity(indices.len());
+        for idx in &indices {
+            let guard = stripes[*idx].clone().lock_owned().await;
             held.push(HeldLock {
-                _guard: guard,
-                _lock: lock,
+                _guard: guard
             });
         }
 
         ChannelLockGuard { _held: held }
+    }
+    
+       fn new_striped_locks() -> Arc<Vec<Arc<tokio::sync::Mutex<()>>>> {
+        Arc::new(
+            (0..256)
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
+        )
     }
 
     async fn consume_lock(&self, channel_hashes: &[u64]) -> (ChannelLockGuard, ChannelLockGuard) {
@@ -134,7 +135,6 @@ where
 
 struct HeldLock {
     _guard: tokio::sync::OwnedMutexGuard<()>,
-    _lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct ChannelLockGuard {
@@ -184,8 +184,6 @@ where
 
         *self.event_log.lock().expect("event log lock") = Vec::new();
         *self.produce_counter.lock().expect("produce counter lock") = BTreeMap::new();
-        self.phase_a_locks.clear();
-        self.phase_b_locks.clear();
 
         let history_reader = self.get_history_repository().get_history_reader(root)?;
         self.create_new_hot_store(history_reader);
@@ -464,8 +462,8 @@ where
             replay_data: Arc::new(Mutex::new(MultisetMultiMap::empty())),
             logger: Arc::new(Mutex::new(Box::new(BasicLogger::new()))),
             replay_waiting_continuations_estimate: Arc::new(AtomicI64::new(0)),
-            phase_a_locks: Arc::new(DashMap::new()),
-            phase_b_locks: Arc::new(DashMap::new()),
+            phase_a_locks: Self::new_striped_locks(),
+            phase_b_locks: Self::new_striped_locks(),
         }
     }
 
@@ -491,8 +489,8 @@ where
             replay_data: Arc::new(Mutex::new(MultisetMultiMap::empty())),
             logger: Arc::new(Mutex::new(logger)),
             replay_waiting_continuations_estimate: Arc::new(AtomicI64::new(0)),
-            phase_a_locks: Arc::new(DashMap::new()),
-            phase_b_locks: Arc::new(DashMap::new()),
+            phase_a_locks: Self::new_striped_locks(),
+            phase_b_locks: Self::new_striped_locks(),
         }
     }
 
