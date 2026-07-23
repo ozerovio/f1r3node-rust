@@ -13,6 +13,9 @@ use super::transaction::helpers;
 /// Only extracts user deploy transfers (not PreCharge/Refund/System deploys).
 /// For user deploys: first report batch is precharge (skip), subsequent batches
 /// where sender == deployer are user transfers.
+///
+/// walks all report batches and takes the first transfer found (the precharge)
+/// to determine the deployer, rather than assuming a hardcoded batch index
 pub fn extract_transfers_from_report(
     report: &BlockEventInfo,
     transfer_unforgeable: &Par,
@@ -26,32 +29,26 @@ pub fn extract_transfers_from_report(
             .map(|info| info.sig.clone())
             .unwrap_or_default();
 
-        if deploy.report.is_empty() {
-            continue;
+        let mut all_transfers = Vec::new();
+        for single_report in &deploy.report {
+            all_transfers.extend(find_transfers_in_report(
+                single_report,
+                transfer_unforgeable,
+            ));
         }
 
-        // First report batch is precharge — extract deployer address from it
-        let first_batch_transactions =
-            find_transfers_in_report(&deploy.report[0], transfer_unforgeable);
-        let deployer_addr = first_batch_transactions
-            .first()
-            .map(|t| t.from_addr.clone());
-
-        // Subsequent batches: transactions where sender == deployer are user transfers
-        let mut user_transfers = Vec::new();
-        for single_report in deploy.report.iter().skip(1) {
-            let transfers = find_transfers_in_report(single_report, transfer_unforgeable);
-            for transfer in transfers {
-                match deployer_addr.as_ref() {
-                    Some(addr) if transfer.from_addr == *addr => {
-                        user_transfers.push(transfer);
-                    }
-                    _ => {
-                        // Refund or system side-effect — not a user transfer
-                    }
-                }
+        let mut transfers_iter = all_transfers.into_iter();
+        let deployer_addr = match transfers_iter.next() {
+            Some(precharge) => precharge.from_addr,
+            None => {
+                transfers_by_deploy.insert(deploy_sig, Vec::new());
+                continue;
             }
-        }
+        };
+
+        let user_transfers: Vec<TransferInfo> = transfers_iter
+            .filter(|t| t.from_addr == deployer_addr)
+            .collect();
 
         transfers_by_deploy.insert(deploy_sig, user_transfers);
     }
