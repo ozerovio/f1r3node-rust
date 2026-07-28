@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use crypto::rust::public_key::PublicKey;
 use models::casper::{BlockEventInfo, TransferInfo};
 use models::rhoapi::Par;
+use rholang::rust::interpreter::util::vault_address::VaultAddress;
 
 use super::transaction::helpers;
 
@@ -29,6 +31,21 @@ pub fn extract_transfers_from_report(
             .map(|info| info.sig.clone())
             .unwrap_or_default();
 
+        let deployer_pk = deploy
+            .deploy_info
+            .as_ref()
+            .map(|info| info.deployer.clone())
+            .unwrap_or_default();
+
+        let Ok(pk_bytes) = hex::decode(&deployer_pk) else {
+            continue;
+        };
+        let pk = PublicKey::from_bytes(&pk_bytes);
+        let Some(deployer_vault) = VaultAddress::from_public_key(&pk) else {
+            continue;
+        };
+        let deployer_addr = deployer_vault.to_base58();
+
         let mut all_transfers = Vec::new();
         for single_report in &deploy.report {
             all_transfers.extend(find_transfers_in_report(
@@ -37,22 +54,16 @@ pub fn extract_transfers_from_report(
             ));
         }
 
-        let mut transfers_iter = all_transfers.into_iter();
-        let deployer_addr = match transfers_iter.next() {
-            Some(precharge) => precharge.from_addr,
-            None => {
-                transfers_by_deploy.insert(deploy_sig, Vec::new());
-                continue;
-            }
-        };
+        let mut deployer_sent = all_transfers
+            .into_iter()
+            .filter(|t| t.from_addr == deployer_addr);
+        deployer_sent.next();
+        let user_transfers: Vec<TransferInfo> = deployer_sent.collect();
 
-        let user_transfers: Vec<TransferInfo> = transfers_iter
-            .filter(|t| t.from_addr == deployer_addr)
-            .collect();
-
-        transfers_by_deploy.insert(deploy_sig, user_transfers);
+        if !user_transfers.is_empty() {
+            transfers_by_deploy.insert(deploy_sig, user_transfers);
+        }
     }
-
     transfers_by_deploy
 }
 
@@ -127,6 +138,8 @@ struct RawTransfer {
 
 #[cfg(test)]
 mod tests {
+    use crypto::rust::signatures::secp256k1::Secp256k1;
+    use crypto::rust::signatures::signatures_alg::SignaturesAlg;
     use models::casper::{
         report_proto, BlockEventInfo, DeployInfo, DeployInfoWithEventData, LightBlockInfo,
         ReportCommProto, ReportConsumeProto, ReportProduceProto, ReportProto, SingleReport,
@@ -136,6 +149,16 @@ mod tests {
     use models::rhoapi::{Expr, GPrivate, GUnforgeable, ListParWithRandom};
 
     use super::*;
+
+    fn make_deployer() -> (String, String) {
+        let secp256k1 = Secp256k1;
+        let (_sk, pk) = secp256k1.new_key_pair();
+        let deployer_hex = hex::encode(&pk.bytes);
+        let vault_addr = VaultAddress::from_public_key(&pk)
+            .expect("freshly generated key should be a valid curve point")
+            .to_base58();
+        (deployer_hex, vault_addr)
+    }
 
     fn make_par_string(s: &str) -> Par {
         Par {
@@ -170,6 +193,7 @@ mod tests {
         from: &str,
         to: &str,
         amount: i64,
+        deployer_hex: &str,
     ) -> BlockEventInfo {
         // Transfer produce data: [from_addr, _, to_addr, amount, _, ret_unforgeable]
         let ret_unforg = make_transfer_unforgeable();
@@ -216,6 +240,7 @@ mod tests {
             deploys: vec![DeployInfoWithEventData {
                 deploy_info: Some(DeployInfo {
                     sig: deploy_sig.to_string(),
+                    deployer: deployer_hex.to_string(),
                     ..Default::default()
                 }),
                 report: vec![precharge_report, user_report],
@@ -228,12 +253,14 @@ mod tests {
     #[test]
     fn extract_transfers_finds_user_transfers() {
         let transfer_unforgeable = make_transfer_unforgeable();
+        let (deployer_hex, deployer_addr) = make_deployer();
         let report = make_block_event_info_with_transfer(
             "deploy_abc",
             &transfer_unforgeable,
-            "sender_addr",
+            &deployer_addr,
             "receiver_addr",
             1000,
+            &deployer_hex,
         );
 
         let result = extract_transfers_from_report(&report, &transfer_unforgeable);
@@ -242,7 +269,7 @@ mod tests {
         assert_eq!(transfers.len(), 1, "should have one user transfer");
 
         let t = &transfers[0];
-        assert_eq!(t.from_addr, "sender_addr");
+        assert_eq!(t.from_addr, deployer_addr);
         assert_eq!(t.to_addr, "receiver_addr");
         assert_eq!(t.amount, 1000);
         assert!(t.success);
@@ -252,6 +279,7 @@ mod tests {
     #[test]
     fn extract_transfers_returns_empty_for_no_transfer_deploy() {
         let transfer_unforgeable = make_transfer_unforgeable();
+        let (deployer_hex, _deployer_addr) = make_deployer();
 
         // Deploy with empty reports (no COMM events on transfer channel)
         let report = BlockEventInfo {
@@ -259,6 +287,7 @@ mod tests {
             deploys: vec![DeployInfoWithEventData {
                 deploy_info: Some(DeployInfo {
                     sig: "deploy_no_transfer".to_string(),
+                    deployer: deployer_hex,
                     ..Default::default()
                 }),
                 report: vec![SingleReport { events: vec![] }, SingleReport {
@@ -271,9 +300,9 @@ mod tests {
 
         let result = extract_transfers_from_report(&report, &transfer_unforgeable);
 
-        let transfers = result
-            .get("deploy_no_transfer")
-            .expect("should have deploy entry");
-        assert!(transfers.is_empty(), "should have no transfers");
+        assert!(
+            result.get("deploy_no_transfer").is_none(),
+            "deploy with no transfers should have no map entry at all"
+        );
     }
 }
