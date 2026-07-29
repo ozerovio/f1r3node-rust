@@ -12,12 +12,8 @@ use super::transaction::helpers;
 /// Scans each deploy's execution report for COMM events on the `transfer_unforgeable`
 /// channel, then extracts from/to/amount/success from the produce data.
 ///
-/// Only extracts user deploy transfers (not PreCharge/Refund/System deploys).
-/// For user deploys: first report batch is precharge (skip), subsequent batches
-/// where sender == deployer are user transfers.
-///
-/// walks all report batches and takes the first transfer found (the precharge)
-/// to determine the deployer, rather than assuming a hardcoded batch index
+/// The deployer's vault address is derived from their public key (`deploy_info.deployer`).
+/// Transfers sent by the deployer are assumed to start with a precharge (skipped).
 pub fn extract_transfers_from_report(
     report: &BlockEventInfo,
     transfer_unforgeable: &Par,
