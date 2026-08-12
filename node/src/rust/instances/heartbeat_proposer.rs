@@ -550,14 +550,14 @@ async fn check_lfb_and_propose(
         && lfb_lag_blocks > 0
         && lag_recovery_leader
         && stale_recovery_window_open
-        && !empty_frontier_backpressure
+        && (!empty_frontier_backpressure || frontier_is_stale)
         && (!self_proposed_too_recently || deploy_grace_active)
         && !stale_lfb_recovery_due;
     let high_lag_recovery_due = !has_pending_deploys
         && lfb_lag_blocks > lag_recovery_threshold
         && lag_recovery_leader
         && stale_recovery_window_open
-        && !empty_frontier_backpressure
+        && (!empty_frontier_backpressure || frontier_is_stale)
         && (!self_proposed_too_recently || deploy_grace_active);
     // Convergence recovery: when the LFB is stale and we have unjustified peer blocks,
     // propose a convergence block that references all known tips. This breaks the deadlock
