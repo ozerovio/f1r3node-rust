@@ -841,6 +841,9 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
         let gc_block_dag_storage = block_dag_storage.clone();
         let gc_block_store = block_store.clone();
         let gc_runtime_manager = Arc::new(runtime_manager.clone());
+        let gc_state = Arc::new(parking_lot::Mutex::new(
+            casper::rust::util::mergeable_channels_gc::GcState::new(),
+        ));
         let gc_interval = conf.casper.mergeable_channels_gc_interval;
         let gc_casper_shard_conf = CasperShardConf {
             fault_tolerance_threshold: conf.casper.fault_tolerance_threshold,
@@ -897,6 +900,7 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
                 let gc_block_store = gc_block_store.clone();
                 let gc_runtime_manager = gc_runtime_manager.clone();
                 let gc_casper_shard_conf = gc_casper_shard_conf.clone();
+                let gc_state = gc_state.clone();
                 let gc_interval = gc_interval;
 
                 Box::pin(async move {
@@ -904,17 +908,32 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
                     tokio::time::sleep(gc_interval).await;
 
                     // Run GC
-                    let dag = gc_block_dag_storage
-                        .get_representation()
+                    let run_gc = || -> Result<(), CasperError> {
+                        let dag = gc_block_dag_storage
+                            .get_representation()
+                            .map_err(|e| CasperError::RuntimeError(e.to_string()))?;
+                        let mut gc_state = gc_state.lock();
+                        mergeable_channels_gc::collect_garbage(
+                            &dag,
+                            &gc_block_store,
+                            &gc_runtime_manager,
+                            &gc_casper_shard_conf,
+                            &mut gc_state,
+                        )
                         .map_err(|e| CasperError::RuntimeError(e.to_string()))?;
-                    mergeable_channels_gc::collect_garbage(
-                        &dag,
-                        &gc_block_store,
-                        &gc_runtime_manager,
-                        &gc_casper_shard_conf,
-                    )
-                    .await
-                    .map_err(|e| CasperError::RuntimeError(e.to_string()))?;
+
+                        Ok(())
+                    };
+
+                    match tokio::runtime::Handle::try_current() {
+                        Ok(handle)
+                            if handle.runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::MultiThread =>
+                        {
+                            tokio::task::block_in_place(run_gc)?
+                        }
+                        _ => run_gc()?,
+                    }
 
                     Ok::<(), CasperError>(())
                 })
