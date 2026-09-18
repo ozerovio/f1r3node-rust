@@ -1,6 +1,7 @@
 // See casper/src/main/scala/coop/rchain/casper/merging/ConflictSetMerger.scala
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use models::rhoapi::ListParWithRandom;
@@ -16,7 +17,7 @@ use rspace_plus_plus::rspace::merger::state_change::StateChange;
 use shared::rust::hashable_set::HashableSet;
 use tracing::{debug, info};
 
-type Branch<R> = std::sync::Arc<HashableSet<R>>;
+pub type Branch<R> = Arc<HashableSet<R>>;
 
 // Utility for timing operations
 fn measure_time<T, F: FnOnce() -> T>(f: F) -> (T, Duration) {
@@ -382,7 +383,7 @@ pub fn resolve_conflicts<R: Clone + Eq + std::hash::Hash + PartialOrd + Ord>(
                 branch.0.iter().all(|item| reject_branch.0.contains(item))
             })
         })
-        .map(|branch| std::sync::Arc::try_unwrap(branch).unwrap_or_else(|a| (*a).clone()))
+        .map(|branch| (*branch).clone())
         .collect();
 
     if tracing::enabled!(target: "f1r3fly.merge.step", tracing::Level::DEBUG) {
@@ -1219,7 +1220,7 @@ mod tests {
     }
 
     fn branch(items: &[i32]) -> Branch<i32> {
-        std::sync::Arc::new(HashableSet(items.iter().copied().collect::<HashSet<i32>>()))
+        Arc::new(HashableSet(items.iter().copied().collect::<HashSet<i32>>()))
     }
 
     fn rejection_option(branches: &[Branch<i32>]) -> HashableSet<Branch<i32>> {
@@ -1399,7 +1400,7 @@ mod tests {
                         .map(|i| {
                             let mut s = HashSet::new();
                             s.insert(*i);
-                            std::sync::Arc::new(HashableSet(s))
+                            Arc::new(HashableSet(s))
                         })
                         .collect(),
                 )
@@ -1407,7 +1408,7 @@ mod tests {
             // Empty conflict map — every branch as a key with no conflicts.
             // This test exercises only the rejection-via-mergeable-overflow
             // path; the conflict-detection path is covered elsewhere.
-            |branches: &HashableSet<std::sync::Arc<HashableSet<i32>>>| {
+            |branches: &HashableSet<Arc<HashableSet<i32>>>| {
                 Ok(branches
                     .0
                     .iter()
