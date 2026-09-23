@@ -1259,7 +1259,7 @@ where
     // `bootstrapName(`rho:system:...`)`.
     for (tag_par, merge_type) in mergeable_tags.iter() {
         if let MergeType::BitmaskOr = merge_type {
-            tracing::info!(
+            tracing::debug!(
                 target: "f1r3fly.merge.tag_check.validation",
                 "URI binding inserted: rho:system:bitmaskMergeableTag -> Par(unforgeables={}, exprs={}, bundles={})",
                 tag_par.unforgeables.len(),
