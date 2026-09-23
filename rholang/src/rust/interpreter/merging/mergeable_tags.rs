@@ -83,6 +83,21 @@ pub fn default_mergeable_tags() -> HashMap<Par, MergeType> {
     tags
 }
 
+/// The tag bound to `rho:system:bitmaskMergeableTag`. Registry.rho reads that single
+/// URI, so a second BitmaskOr tag is refused rather than left to map iteration order.
+pub fn bitmask_or_tag(tags: &HashMap<Par, MergeType>) -> Option<&Par> {
+    let mut found = tags
+        .iter()
+        .filter(|(_, merge_type)| **merge_type == MergeType::BitmaskOr)
+        .map(|(tag, _)| tag);
+    let tag = found.next();
+    assert!(
+        found.next().is_none(),
+        "at most one BitmaskOr mergeable tag is supported: rho:system:bitmaskMergeableTag binds a single tag"
+    );
+    tag
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +136,21 @@ mod tests {
             tags.get(&bitmask_or_mergeable_tag_name()),
             Some(&MergeType::BitmaskOr)
         );
+    }
+
+    #[test]
+    fn the_default_registry_binds_its_bitmask_tag() {
+        assert_eq!(
+            bitmask_or_tag(&default_mergeable_tags()),
+            Some(&bitmask_or_mergeable_tag_name())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at most one BitmaskOr mergeable tag")]
+    fn a_second_bitmask_tag_is_refused() {
+        let mut tags = default_mergeable_tags();
+        tags.insert(Par::default(), MergeType::BitmaskOr);
+        bitmask_or_tag(&tags);
     }
 }
