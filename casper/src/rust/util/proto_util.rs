@@ -173,41 +173,28 @@ pub fn weight_from_validator_by_dag(
     // fetch-and-retry, where a `KeyNotFound` hard-failed admission (the #306
     // storm on restored joiners and observers). No backtrace in the context —
     // this is a hot path with exactly one caller (`estimator::build_scores_map`).
-    let block_metadata = dag
-        .lookup(block_hash)?
-        .ok_or_else(|| KvStoreError::MissingBlock {
-            hash: block_hash.clone(),
-            context: MissingBlockContext::new("weight_from_validator_by_dag: traversed block"),
-        })?;
-
-    // Try to get parent's weight for this validator
-    match block_metadata.parents.first() {
-        Some(parent_hash) => {
-            // Look up parent
-            let parent_metadata =
-                dag.lookup(parent_hash)?
-                    .ok_or_else(|| KvStoreError::MissingBlock {
-                        hash: parent_hash.clone(),
-                        context: MissingBlockContext::new(
-                            "weight_from_validator_by_dag: main parent",
-                        ),
-                    })?;
-            // Return validator's weight from parent or 0 if not found
-            Ok(parent_metadata
-                .weight_map
-                .get(validator)
-                .cloned()
-                .unwrap_or(0))
-        }
+    let weight_source = match dag.main_parent(block_hash) {
+        Some(parent) => parent,
+        None if dag.contains(block_hash) => block_hash.clone(),
         None => {
-            // No parents (genesis) - use current block's weight map
-            Ok(block_metadata
-                .weight_map
-                .get(validator)
-                .cloned()
-                .unwrap_or(0))
+            return Err(KvStoreError::MissingBlock {
+                hash: block_hash.clone(),
+                context: MissingBlockContext::new("weight_from_validator_by_dag: traversed block"),
+            });
         }
-    }
+    };
+
+    let weight_metadata =
+        dag.lookup(&weight_source)?
+            .ok_or_else(|| KvStoreError::MissingBlock {
+                hash: weight_source.clone(),
+                context: MissingBlockContext::new("weight_from_validator_by_dag: main parent"),
+            })?;
+    Ok(weight_metadata
+        .weight_map
+        .get(validator)
+        .cloned()
+        .unwrap_or(0))
 }
 
 /// Get weight from validator

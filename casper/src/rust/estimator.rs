@@ -228,12 +228,15 @@ impl Estimator {
             lca_block_number: i64,
             block_dag: &KeyValueDagRepresentation,
         ) -> Result<Vec<BlockHash>, KvStoreError> {
-            // Phase 12 (PERF-1): one `lookup_unsafe` call per node, not two.
-            // The prior version read `block_number` and then re-read the
-            // whole `BlockMetadata` for `parents` — doubling lock
-            // acquisitions on the BFS-bound fork-choice path.
-            let meta = block_dag.lookup_unsafe(hash)?;
-            if meta.block_number < lca_block_number {
+            // PERF: the height and the main parent both come from the
+            // in-memory DAG indices, so the `BlockMetadata` row is not read
+            // on this path at all. Both fields are immutable for a given
+            // hash — they are written into the indices from the same row in
+            // `add_block_to_dag_state` — so the index answer is the row
+            // answer. Earlier revisions read the whole row here (and, before
+            // that, read it twice) purely to reach these two fields.
+            let block_number = block_dag.block_number_unsafe(hash)?;
+            if block_number < lca_block_number {
                 Ok(Vec::new())
             } else {
                 // MAIN parent only. Crediting a validator's weight to every DAG
@@ -246,7 +249,7 @@ impl Estimator {
                 // construction, which is the exclusivity the clique theorem
                 // assumes. `main_parent` is `parents.first()`
                 // (block_metadata_store.rs:119).
-                Ok(meta.parents.into_iter().take(1).collect())
+                Ok(block_dag.main_parent(hash).into_iter().collect())
             }
         }
 
@@ -257,9 +260,7 @@ impl Estimator {
             block_dag: &mut KeyValueDagRepresentation,
             lowest_common_ancestor: &BlockHash,
         ) -> Result<HashMap<BlockHash, i64>, KvStoreError> {
-            let lca_block_num = block_dag
-                .lookup_unsafe(lowest_common_ancestor)?
-                .block_number;
+            let lca_block_num = block_dag.block_number_unsafe(lowest_common_ancestor)?;
 
             // Phase 12 (PERF-2): merge BFS traversal with weight accumulation
             // instead of building a Vec of traversed hashes then re-iterating.
