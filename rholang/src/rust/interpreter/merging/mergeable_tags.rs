@@ -55,6 +55,10 @@ pub fn unforgeable_name_rng(deployer: &PublicKey, timestamp: i64) -> Blake2b512R
 fn tag_name(deployer_pk_hex: &str, timestamp: i64) -> Par {
     let pubkey = pub_key_from_hex(deployer_pk_hex);
     let mut rng = unforgeable_name_rng(&pubkey, timestamp);
+    // The tag must equal `MergeableTag` from NonNegativeNumber.rho, the second
+    // name its `new` draws from this seed (the first is `NonNegativeNumber`).
+    // The BitmaskOr tag uses the same derivation; changing it changes the tag
+    // bytes pinned in the tests below.
     rng.next();
     let unforgeable_byte = rng.next();
     Par::default().with_unforgeables(vec![GUnforgeable {
