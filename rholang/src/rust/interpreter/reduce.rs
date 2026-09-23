@@ -858,6 +858,10 @@ impl DebruijnInterpreter {
 
         let result = head.and_then(|h| self.mergeable_tags.get(h).copied());
 
+        if !tracing::enabled!(target: "f1r3fly.merge.tag_check.validation", tracing::Level::TRACE) {
+            return result;
+        }
+
         // Diagnostic trace: every channel write/consume invokes this. Logs
         // distinguish (a) tuple channels that match a registered tag (mergeable),
         // (b) tuple channels with a head that ISN'T in the tag registry
