@@ -43,7 +43,7 @@ pub fn pub_key_from_hex(priv_key_hex: &str) -> PublicKey {
     Secp256k1.to_public(&private_key)
 }
 
-fn unforgeable_name_rng(deployer: &PublicKey, timestamp: i64) -> Blake2b512Random {
+pub fn unforgeable_name_rng(deployer: &PublicKey, timestamp: i64) -> Blake2b512Random {
     let seed = DeployDataProto {
         deployer: deployer.bytes.clone(),
         timestamp,
