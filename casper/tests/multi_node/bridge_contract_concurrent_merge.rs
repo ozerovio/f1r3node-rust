@@ -86,7 +86,8 @@ async fn two_concurrent_bridges_should_merge_without_rejection() {
     // Each deploy gets its own timestamp, so no two deploys are byte-identical.
     // Bridge deploys need a large phlo budget — they register 3 contracts via
     // insertArbitrary (each is a TreeHashMap insert) plus call findOrCreate
-    // for the bridge's own vault. The integration test uses 500M; we match.
+    // for the bridge's own vault. Genesis funds each deployer with 9M, so the
+    // limit must stay below that or payment fails before the contract runs.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -105,13 +106,13 @@ async fn two_concurrent_bridges_should_merge_without_rejection() {
     };
     let bridge1_deploy = deploy(
         bridge_rho.clone(),
-        500_000_000,
+        5_000_000,
         construct_deploy::DEFAULT_SEC.clone(),
         0,
     );
     let bridge2_deploy = deploy(
         bridge_rho.clone(),
-        500_000_000,
+        5_000_000,
         construct_deploy::DEFAULT_SEC2.clone(),
         1,
     );
@@ -150,6 +151,19 @@ async fn two_concurrent_bridges_should_merge_without_rejection() {
         .await
         .expect("validator 2 propose third sibling");
 
+    for block in [&block1, &block2] {
+        assert!(
+            block.body.deploys.iter().all(|deploy| !deploy.is_failed),
+            "a bridge deploy failed: {:?}",
+            block
+                .body
+                .deploys
+                .iter()
+                .map(|deploy| deploy.system_deploy_error.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     eprintln!(
         "PHASE 1 siblings: block1={} (bridge1), block2={} (bridge2), block3={} (third)",
         hex::encode(&block1.block_hash[..std::cmp::min(8, block1.block_hash.len())]),
@@ -160,25 +174,9 @@ async fn two_concurrent_bridges_should_merge_without_rejection() {
     // Phase 2: full pairwise sync so every node has both sibling blocks
     // in its DAG. After this, validators[2]'s next proposal will multi-parent
     // over both.
-    for sender_idx in 0..3 {
-        for receiver_idx in 0..3 {
-            if sender_idx == receiver_idx {
-                continue;
-            }
-            let (first_idx, second_idx) = if sender_idx < receiver_idx {
-                (sender_idx, receiver_idx)
-            } else {
-                (receiver_idx, sender_idx)
-            };
-            let (left, right) = nodes.split_at_mut(second_idx);
-            let first = &mut left[first_idx];
-            let second = &mut right[0];
-            first
-                .sync_with_one(second)
-                .await
-                .expect("sync first → second");
-        }
-    }
+    TestNode::sync_all(&mut nodes)
+        .await
+        .expect("full pairwise sync");
 
     // Phase 3: validators[0] proposes a follow-up block. With its own sibling
     // and both peers' siblings visible, fork choice picks all three as
