@@ -12,8 +12,9 @@ use casper::rust::engine::block_retriever::BlockRetriever;
 use casper::rust::engine::casper_launch::CasperLaunch;
 use casper::rust::errors::CasperError;
 use casper::rust::metrics_constants::{
-    BLOCK_PROCESSING_QUEUE_PENDING_METRIC, BLOCK_PROCESSOR_METRICS_SOURCE,
-    PROPOSER_QUEUE_PENDING_METRIC, PROPOSER_QUEUE_REJECTED_TOTAL_METRIC, VALIDATOR_METRICS_SOURCE,
+    BLOCK_PROCESSING_IN_FLIGHT_METRIC, BLOCK_PROCESSING_QUEUE_PENDING_METRIC,
+    BLOCK_PROCESSOR_METRICS_SOURCE, PROPOSER_QUEUE_PENDING_METRIC,
+    PROPOSER_QUEUE_REJECTED_TOTAL_METRIC, VALIDATOR_METRICS_SOURCE,
 };
 use casper::rust::state::instances::ProposerState;
 use casper::rust::ProposeFunction;
@@ -335,6 +336,12 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
     )
     .set(0.0);
     let block_processor_queue_watch = block_processor_queue_tx.downgrade();
+
+    // Block processing state - set of items currently in processing.
+    // Sampled next to the queue depth: a marker that is neither queued nor
+    // processing is leaked, and leaks wedge the node at the in-flight cap.
+    let block_processor_state_ref = Arc::new(dashmap::DashSet::<BlockHash>::new());
+    let block_processor_state_watch = Arc::downgrade(&block_processor_state_ref);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -349,11 +356,15 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
                 "source" => BLOCK_PROCESSOR_METRICS_SOURCE
             )
             .set(pending as f64);
+            if let Some(in_flight) = block_processor_state_watch.upgrade() {
+                metrics::gauge!(
+                    BLOCK_PROCESSING_IN_FLIGHT_METRIC,
+                    "source" => BLOCK_PROCESSOR_METRICS_SOURCE
+                )
+                .set(in_flight.len() as f64);
+            }
         }
     });
-
-    // Block processing state - set of items currently in processing
-    let block_processor_state_ref = Arc::new(dashmap::DashSet::<BlockHash>::new());
 
     // Read RPConf once for use in multiple places
     let rp_conf = rp_conf_cell
