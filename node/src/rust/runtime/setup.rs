@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use casper::rust::blocks::block_processor::BlockProcessor;
+use casper::rust::blocks::block_processor::{BlockProcessor, BlockQueueItem, InFlightBlocks};
 use casper::rust::blocks::proposer::proposer::{ProductionProposer, ProposerResult};
 use casper::rust::casper::{Casper, MultiParentCasper};
 use casper::rust::engine::block_retriever::BlockRetriever;
@@ -22,8 +22,7 @@ use comm::rust::discovery::node_discovery::NodeDiscovery;
 use comm::rust::p2p::packet_handler::PacketHandler;
 use comm::rust::rp::connect::ConnectionsCell;
 use comm::rust::transport::transport_layer::TransportLayer;
-use models::rust::block_hash::BlockHash;
-use models::rust::casper::protocol::casper_message::{ApprovedBlock, BlockMessage};
+use models::rust::casper::protocol::casper_message::ApprovedBlock;
 use shared::rust::shared::f1r3fly_events::F1r3flyEvents;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, info, trace, warn};
@@ -85,9 +84,9 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
         usize,
         Option<Arc<RwLock<ProposerState>>>,
         BlockProcessor<T>,
-        Arc<dashmap::DashSet<BlockHash>>,
-        mpsc::Sender<(Arc<dyn MultiParentCasper + Send + Sync>, BlockMessage)>,
-        mpsc::Receiver<(Arc<dyn MultiParentCasper + Send + Sync>, BlockMessage)>,
+        Arc<InFlightBlocks>,
+        mpsc::Sender<BlockQueueItem>,
+        mpsc::Receiver<BlockQueueItem>,
         Option<Arc<ProposeFunction>>,
         Arc<casper::rust::api::block_report_api::BlockReportAPI>,
         block_storage::rust::key_value_block_store::KeyValueBlockStore,
@@ -322,9 +321,7 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
     // to consumer (BlockProcessorInstance)
     let block_processor_queue_max_pending = block_processor_queue_max_pending();
     let (block_processor_queue_tx, block_processor_queue_rx) =
-        mpsc::channel::<(Arc<dyn MultiParentCasper + Send + Sync>, BlockMessage)>(
-            block_processor_queue_max_pending,
-        );
+        mpsc::channel::<BlockQueueItem>(block_processor_queue_max_pending);
 
     // Queue depth is where memory pressure moves when parallel drain is
     // bounded, so it must be observable alongside block-processing.active.
@@ -340,7 +337,7 @@ pub async fn setup_node_program<T: TransportLayer + Send + Sync + Clone + 'stati
     // Block processing state - set of items currently in processing.
     // Sampled next to the queue depth: a marker that is neither queued nor
     // processing is leaked, and leaks wedge the node at the in-flight cap.
-    let block_processor_state_ref = Arc::new(dashmap::DashSet::<BlockHash>::new());
+    let block_processor_state_ref = Arc::new(InFlightBlocks::new());
     let block_processor_state_watch = Arc::downgrade(&block_processor_state_ref);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
