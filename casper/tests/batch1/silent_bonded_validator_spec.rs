@@ -80,12 +80,16 @@ async fn run_rounds(nodes: &mut [TestNode], shard_id: &str, first_deploy: i32) {
     }
 }
 
-/// Three validators with stake 1, 3 and 5 run a node. A fourth bonds 1000 while
-/// the network runs and becomes active at the next epoch boundary. With
-/// `node_count == 4` the newcomer has a node (index 3) that receives blocks but
-/// does not propose. Returns the nodes after `ROUNDS` blocks, with the newcomer
-/// active at the last finalized block.
-async fn network_with_a_silent_newcomer(node_count: usize) -> (Vec<TestNode>, String) {
+/// Three validators with stake 1, 3 and 5 run a node. A fourth bonds
+/// `newcomer_bond` while the network runs and becomes active at the next epoch
+/// boundary. With `node_count == 4` the newcomer has a node (index 3) that
+/// receives blocks but does not propose. Returns the nodes after `ROUNDS`
+/// blocks, with the newcomer active at the last finalized block.
+async fn network_with_a_silent_newcomer(
+    node_count: usize,
+    newcomer_bond: i64,
+    fault_tolerance_threshold_ppm: i64,
+) -> (Vec<TestNode>, String) {
     let validator_key_pairs = vec![
         DEFAULT_VALIDATOR_KEY_PAIRS[0].clone(),
         DEFAULT_VALIDATOR_KEY_PAIRS[1].clone(),
@@ -100,6 +104,7 @@ async fn network_with_a_silent_newcomer(node_count: usize) -> (Vec<TestNode>, St
         .collect();
     let mut parameters = GenesisBuilder::build_genesis_parameters(validator_key_pairs, &bonds);
     parameters.2.proof_of_stake.epoch_length = 4;
+    parameters.2.proof_of_stake.fault_tolerance_threshold_ppm = fault_tolerance_threshold_ppm;
     let genesis = GenesisBuilder::new()
         .build_genesis_with_parameters(Some(parameters))
         .await
@@ -113,7 +118,8 @@ async fn network_with_a_silent_newcomer(node_count: usize) -> (Vec<TestNode>, St
         node.allow_empty_blocks = true;
     }
 
-    let bond = bonding_util::bonding_deploy(1000, &DEFAULT_SEC, Some(shard_id.clone())).unwrap();
+    let bond =
+        bonding_util::bonding_deploy(newcomer_bond, &DEFAULT_SEC, Some(shard_id.clone())).unwrap();
     TestNode::propagate_block_at_index(&mut nodes, 0, &[bond])
         .await
         .unwrap();
@@ -133,12 +139,14 @@ async fn network_with_a_silent_newcomer(node_count: usize) -> (Vec<TestNode>, St
     (nodes, shard_id)
 }
 
-/// #18: the silent newcomer's stake (1000) outweighs the running validators
-/// (1 + 3 + 5). Finalization must keep advancing, and a user deploy sent while
-/// the newcomer is silent must finalize instead of expiring.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_validator_bonded_later_that_never_runs_does_not_stall_finalization() {
-    let (mut nodes, shard_id) = network_with_a_silent_newcomer(3).await;
+/// Finalization must keep advancing while the newcomer is silent, and a user
+/// deploy sent in that time must finalize instead of expiring.
+async fn finalization_continues_with_a_silent_newcomer(
+    newcomer_bond: i64,
+    fault_tolerance_threshold_ppm: i64,
+) {
+    let (mut nodes, shard_id) =
+        network_with_a_silent_newcomer(3, newcomer_bond, fault_tolerance_threshold_ppm).await;
     let before = nodes[0].casper.last_finalized_block().await.unwrap();
 
     let deploy = construct_deploy::basic_deploy_data(1000, None, Some(shard_id.clone())).unwrap();
@@ -170,13 +178,28 @@ async fn a_validator_bonded_later_that_never_runs_does_not_stall_finalization() 
     );
 }
 
+/// #18: the silent newcomer's stake (1000) outweighs the running validators
+/// (1 + 3 + 5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_validator_bonded_later_that_never_runs_does_not_stall_finalization() {
+    finalization_continues_with_a_silent_newcomer(1000, 0).await;
+}
+
+/// #18 inside the fault model: with a one-third fault tolerance threshold, a
+/// silent newcomer with 6 of 15 stake (40%) leaves 9 of 15 to agree, below the
+/// two thirds that finalization needs if the newcomer counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_newcomer_with_a_minority_stake_does_not_stall_finalization() {
+    finalization_continues_with_a_silent_newcomer(6, 333_333).await;
+}
+
 /// #18 for block creation: with the synchrony constraint that heartbeat shards
 /// use (0.33), the silent newcomer must not stop a running validator from
 /// proposing. The other running validators proposed after validator 0, so it
 /// has seen all of the stake that can speak.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_newcomer_does_not_block_the_synchrony_constraint() {
-    let (nodes, _) = network_with_a_silent_newcomer(3).await;
+    let (nodes, _) = network_with_a_silent_newcomer(3, 1000, 0).await;
     let mut snapshot = nodes[0].casper.get_snapshot().await.unwrap();
     snapshot
         .on_chain_state
@@ -210,7 +233,8 @@ async fn a_silent_newcomer_does_not_block_the_synchrony_constraint() {
 /// small validators propose, nothing above the newcomer's block finalizes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_newcomer_that_starts_its_node_is_accepted_and_then_counts() {
-    let (mut nodes, shard_id) = network_with_a_silent_newcomer(4).await;
+    let (mut nodes, shard_id) = network_with_a_silent_newcomer(4, 1000, 0).await;
+    let lfb_before = nodes[0].casper.last_finalized_block().await.unwrap();
 
     let deploy = construct_deploy::basic_deploy_data(2000, None, Some(shard_id.clone())).unwrap();
     let first = TestNode::propagate_block_at_index(&mut nodes, 3, &[deploy])
@@ -228,6 +252,11 @@ async fn a_newcomer_that_starts_its_node_is_accepted_and_then_counts() {
 
     run_rounds(&mut nodes, &shard_id, 3000).await;
     let lfb = nodes[0].casper.last_finalized_block().await.unwrap();
+    assert!(
+        lfb.body.state.block_number > lfb_before.body.state.block_number,
+        "finalization must keep moving once the newcomer counts, but LFB stayed at #{}",
+        lfb.body.state.block_number
+    );
     assert!(
         lfb.body.state.block_number <= first.body.state.block_number,
         "the newcomer's stake must count from its first block (#{}), but LFB is #{}",
