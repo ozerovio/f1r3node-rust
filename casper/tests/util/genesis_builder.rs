@@ -288,6 +288,9 @@ impl GenesisBuilder {
         );
 
         let (validator_key_pairs, genesis_vaults, mut genesis_parameters) = parameters.clone();
+        let fault_tolerance_threshold_ppm = genesis_parameters
+            .proof_of_stake
+            .fault_tolerance_threshold_ppm;
 
         // If vaults were provided via with_vaults(), use them instead of default vaults
         if let Some(ref vaults) = self.vaults {
@@ -348,6 +351,7 @@ impl GenesisBuilder {
             genesis_vaults,
             storage_directory: storage_directory_path,
             rspace_scope_id,
+            fault_tolerance_threshold_ppm,
             _tempdir_guard: None, // No tempdir guard needed with shared LMDB
         })
     }
@@ -361,6 +365,9 @@ pub struct GenesisContext {
     /// The shared RSpace scope_id for all nodes in the same test.
     /// All TestNodes in this test share the same RSpace stores to see each other's state.
     pub rspace_scope_id: String,
+    /// The fault-tolerance threshold written into the genesis PoS contract.
+    /// A running node adopts the on-chain value, so TestNodes use this one.
+    pub fault_tolerance_threshold_ppm: i64,
     // Keep TempDir guard alive to prevent auto-cleanup while context is in use
     // Only the original context holds Some(tempdir), clones have None
     _tempdir_guard: Option<TempDir>,
@@ -376,6 +383,7 @@ impl Clone for GenesisContext {
             genesis_vaults: self.genesis_vaults.clone(),
             storage_directory: self.storage_directory.clone(),
             rspace_scope_id: self.rspace_scope_id.clone(),
+            fault_tolerance_threshold_ppm: self.fault_tolerance_threshold_ppm,
             _tempdir_guard: None, // Clones don't own the directory
         }
     }

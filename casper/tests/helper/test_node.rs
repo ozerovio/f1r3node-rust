@@ -1107,8 +1107,10 @@ impl TestNode {
             floor_seed: None,
             sigs: vec![],
         };
+        let fault_tolerance_threshold_ppm = genesis_context.fault_tolerance_threshold_ppm;
         let shard_conf = CasperShardConf {
-            fault_tolerance_threshold: 0.0,
+            fault_tolerance_threshold: (fault_tolerance_threshold_ppm as f64 / 1_000_000.0) as f32,
+            fault_tolerance_threshold_ppm,
             shard_name: shard_id.clone(),
             parent_shard_id: "".to_string(),
             finalization_rate,
