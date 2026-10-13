@@ -55,6 +55,10 @@ Block persistence, DAG state management, casper buffer, and deploy indexing.
 
 **`KeyValueDeployStorage`** -- Stores `Signed<DeployData>` indexed by deploy signature. Methods: `add()`, `remove()`, `read_all()`, `non_empty()`. Deploy index maps deploy signature to block hash.
 
+**`KeyValueRejectedDeployBuffer`** -- The same implementation (`KeyValueDeployStore`) in a separate LMDB store. It holds the deploys that a merge rejected and that this validator proposes again. The buffer has no size limit. Each block removes the entries whose validity window closed or that expired.
+
+Operator note: the two stores share the LMDB environment `deploystorage`, with a map size of 1 GB. The gauge `deploy.store.size` (label `store`) shows the number of entries at the last full read of each store. The node logs a warning when the rejected deploy buffer holds more than 1,000 entries.
+
 ## Tests
 
 `block_dag_storage_test.rs` (proptest integration), `key_value_block_store.rs` (proptest unit), `casper_buffer_key_value_storage.rs` (tokio async), `doubly_linked_dag_operations.rs` (DAG unit tests).
