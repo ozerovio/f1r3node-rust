@@ -435,10 +435,10 @@ pub async fn key_value_deploy_storage_from_dyn(
 pub async fn key_value_rejected_deploy_buffer_from_dyn(
     kvm: &mut dyn KeyValueStoreManager,
 ) -> Result<
-    block_storage::rust::deploy::key_value_rejected_deploy_buffer::KeyValueRejectedDeployBuffer,
+    block_storage::rust::deploy::key_value_deploy_storage::KeyValueRejectedDeployBuffer,
     shared::rust::store::key_value_store::KvStoreError,
 > {
-    use block_storage::rust::deploy::key_value_rejected_deploy_buffer::KeyValueRejectedDeployBuffer;
+    use block_storage::rust::deploy::key_value_deploy_storage::KeyValueRejectedDeployBuffer;
     use crypto::rust::signatures::signed::Signed;
     use models::rust::casper::protocol::casper_message::DeployData;
     use shared::rust::store::key_value_typed_store_impl::KeyValueTypedStoreImpl;
