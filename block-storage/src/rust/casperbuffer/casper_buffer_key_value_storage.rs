@@ -150,12 +150,16 @@ impl CasperBufferKeyValueStorage {
 
         self.parents_store.put(changes)?;
         let hashes_to_delete: Vec<BlockHashSerde> = hashes_removed.into_iter().collect();
+        let released_at = Self::now_millis();
+        for h in &hashes_to_delete {
+            self.first_seen_ms.insert(h.clone(), released_at);
+        }
+        for h in &orphaned_hashes {
+            self.first_seen_ms.remove(h);
+        }
         let mut hashes_to_delete_with_node = hashes_to_delete;
         hashes_to_delete_with_node.push(hash);
         hashes_to_delete_with_node.extend(orphaned_hashes);
-        for h in &hashes_to_delete_with_node {
-            self.first_seen_ms.remove(h);
-        }
         self.parents_store.delete(hashes_to_delete_with_node)?;
 
         Ok(())
@@ -301,11 +305,11 @@ impl CasperBufferKeyValueStorage {
         stale_ttl_ms: u64,
         max_prune_batch: usize,
         prune_interval_ms: u64,
-    ) -> Result<(usize, usize), KvStoreError> {
+    ) -> Result<(Vec<BlockHashSerde>, Vec<BlockHashSerde>), KvStoreError> {
         let now = Self::now_millis();
         let last_prune = self.last_prune_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last_prune) < prune_interval_ms {
-            return Ok((0, 0));
+            return Ok((Vec::new(), Vec::new()));
         }
         self.last_prune_ms.store(now, Ordering::Relaxed);
 
@@ -316,19 +320,19 @@ impl CasperBufferKeyValueStorage {
             .collect();
         stale_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
-        let mut stale_pruned = 0usize;
+        let mut stale_pruned = Vec::new();
         for (_, hash) in stale_candidates.into_iter().take(max_prune_batch) {
-            match self.remove(hash) {
-                Ok(_) => stale_pruned += 1,
+            match self.remove(hash.clone()) {
+                Ok(_) => stale_pruned.push(hash),
                 Err(KvStoreError::InvalidArgument(_)) => {}
                 Err(e) => return Err(e),
             }
         }
 
-        let mut overflow_pruned = 0usize;
+        let mut overflow_pruned = Vec::new();
         let mut approx_nodes = self.approx_node_count();
         let mut attempts = 0usize;
-        while overflow_pruned < max_prune_batch
+        while overflow_pruned.len() < max_prune_batch
             && attempts < max_prune_batch
             && approx_nodes > max_approx_nodes
         {
@@ -336,18 +340,18 @@ impl CasperBufferKeyValueStorage {
                 .dependency_free_nodes_with_age_ms(now)
                 .into_iter()
                 .collect();
-            oldest_nodes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            oldest_nodes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
             let Some((_, hash)) = oldest_nodes.into_iter().next() else {
                 break;
             };
 
-            let removed = self.remove(hash);
+            let removed = self.remove(hash.clone());
             attempts += 1;
 
             match removed {
                 Ok(_) => {
-                    overflow_pruned += 1;
+                    overflow_pruned.push(hash);
                     approx_nodes = self.approx_node_count();
                 }
                 Err(KvStoreError::InvalidArgument(_)) => {}
@@ -434,6 +438,42 @@ mod tests {
         // When removed hash A is the last parent for hash B, B should be pendant
         assert!(casper_buffer.is_pendant(&b));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overflow_prune_removes_the_oldest_root_and_keeps_a_ready_block(
+    ) -> Result<(), KvStoreError> {
+        let mut kvm = InMemoryStoreManager::new();
+        let store = kvm.store("parents-map".to_string()).await?;
+        let casper_buffer =
+            CasperBufferKeyValueStorage::new_from_kv_store(KeyValueTypedStoreImpl::new(store))
+                .await?;
+
+        let stuck_root = create_block_hash(b"stuck_root");
+        let waiting_child = create_block_hash(b"waiting_child");
+        let ready = create_block_hash(b"ready");
+        casper_buffer.add_relation(stuck_root.clone(), waiting_child.clone())?;
+        casper_buffer.put_pendant(ready.clone())?;
+
+        let now = CasperBufferKeyValueStorage::now_millis();
+        casper_buffer
+            .first_seen_ms
+            .insert(stuck_root.clone(), now.saturating_sub(60_000));
+        casper_buffer.first_seen_ms.insert(ready.clone(), now);
+
+        let (stale, overflow) = casper_buffer.enforce_limits(1, u64::MAX, 10, 0)?;
+
+        assert!(stale.is_empty());
+        assert_eq!(overflow, vec![stuck_root]);
+        assert!(casper_buffer.is_pendant(&ready));
+        assert!(casper_buffer.is_pendant(&waiting_child));
+        let released_at = casper_buffer
+            .first_seen_ms
+            .get(&waiting_child)
+            .map(|seen| *seen)
+            .expect("a released block keeps an age");
+        assert!(released_at >= now);
         Ok(())
     }
 

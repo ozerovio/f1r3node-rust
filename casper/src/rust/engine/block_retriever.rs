@@ -1717,6 +1717,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forgotten_received_block_is_requested_again_as_a_dependency() {
+        let local = peer_node("local", 40400);
+        let rp_conf = create_rp_conf_ask(local.clone(), None, None);
+        let connections = Connections::from_vec(vec![local]);
+        let connections_cell = ConnectionsCell {
+            peers: Arc::new(Mutex::new(connections)),
+        };
+        let requested_blocks: RequestedBlocks = Arc::new(Mutex::new(HashMap::new()));
+        let transport = Arc::new(TransportLayerStub::new());
+        let block_retriever =
+            BlockRetriever::new(requested_blocks, transport, connections_cell, rp_conf);
+
+        let hash: BlockHash = Bytes::from_static(b"pruned-from-buffer");
+        block_retriever
+            .ack_receive(hash.clone())
+            .await
+            .expect("ack");
+        let ignored = block_retriever
+            .admit_hash(
+                hash.clone(),
+                None,
+                AdmitHashReason::MissingDependencyRequested,
+            )
+            .await
+            .expect("admit");
+        assert!(matches!(ignored.status, AdmitHashStatus::Ignore));
+
+        block_retriever.forget_hash_tracking(&hash).expect("forget");
+        let requested = block_retriever
+            .admit_hash(hash, None, AdmitHashReason::MissingDependencyRequested)
+            .await
+            .expect("admit");
+        assert!(matches!(requested.status, AdmitHashStatus::NewRequestAdded));
+    }
+
+    #[tokio::test]
     async fn request_all_should_keep_unresolved_request_tracked_until_retry_budget() {
         let local = peer_node("local", 40400);
         let rp_conf = create_rp_conf_ask(local.clone(), None, None);

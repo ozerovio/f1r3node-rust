@@ -945,12 +945,16 @@ impl<T: TransportLayer + Send + Sync + 'static> BlockProcessorDependencies<T> {
         self.casper_buffer_last_prune_ms
             .store(now_ms, Ordering::Relaxed);
 
-        let (stale_pruned, overflow_pruned) = self.casper_buffer.enforce_limits(
+        let (stale_hashes, overflow_hashes) = self.casper_buffer.enforce_limits(
             CASPER_BUFFER_MAX_APPROX_NODES,
             CASPER_BUFFER_STALE_TTL_MS,
             CASPER_BUFFER_MAX_PRUNE_BATCH,
             prune_interval_ms,
         )?;
+        let (stale_pruned, overflow_pruned) = (stale_hashes.len(), overflow_hashes.len());
+        for hash in stale_hashes.iter().chain(overflow_hashes.iter()) {
+            self.block_retriever.forget_hash_tracking(&hash.0)?;
+        }
         let approx_nodes = self.casper_buffer.approx_node_count();
 
         metrics::gauge!(CASPER_BUFFER_APPROX_NODES_METRIC, "source" => BLOCK_PROCESSOR_METRICS_SOURCE)
