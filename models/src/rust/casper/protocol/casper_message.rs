@@ -1374,6 +1374,22 @@ impl DeployData {
         }
     }
 
+    /// Rebuilds a deploy that this node verified when it accepted it, without
+    /// checking the signature again. Only for the node's own deploy stores:
+    /// a deploy from the network must go through [`DeployData::from_proto`].
+    pub fn from_trusted_proto(proto: DeployDataProto) -> Result<Signed<DeployData>, String> {
+        let sig_algorithm = SignaturesAlgFactory::apply(&proto.sig_algorithm)
+            .ok_or_else(|| format!("Unknown signature algorithm: {}", proto.sig_algorithm))?;
+        let sig = proto.sig.clone();
+        let pk = PublicKey::from_bytes(&proto.deployer);
+        Ok(Signed {
+            data: DeployData::_from_proto(proto)?,
+            pk,
+            sig,
+            sig_algorithm,
+        })
+    }
+
     fn _to_proto(dd: DeployData) -> DeployDataProto {
         DeployDataProto {
             term: dd.term,

@@ -35,7 +35,7 @@ pub(super) fn decode(bytes: &BitVector) -> Result<Signed<DeployData>, KvStoreErr
     if let Some(payload) = bytes.strip_prefix(PREFIX) {
         let proto = DeployDataProto::decode(payload)
             .map_err(|error| KvStoreError::SerializationError(error.to_string()))?;
-        return DeployData::from_proto(proto).map_err(KvStoreError::SerializationError);
+        return DeployData::from_trusted_proto(proto).map_err(KvStoreError::SerializationError);
     }
     metrics::counter!(LEGACY_DECODE_METRIC).increment(1);
     let legacy: Signed<LegacyDeployData> = bincode::deserialize(bytes)?;
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_storage_rejects_tampered_signed_fields() {
+    fn deploy_storage_reads_its_own_records_without_reverifying_signatures() {
         for parameters in [Vec::new(), vec![DeployParameter {
             name: "input".into(),
             value: RholangValue::Int(42),
@@ -135,10 +135,7 @@ mod tests {
             deploy.data.expiration_timestamp = Some(999);
             let bytes = encode(&deploy).unwrap();
             assert!(bytes.starts_with(PREFIX));
-            assert!(matches!(
-                decode(&bytes),
-                Err(KvStoreError::SerializationError(error)) if error == "Invalid signature"
-            ));
+            assert_eq!(decode(&bytes).unwrap(), deploy);
         }
     }
 
