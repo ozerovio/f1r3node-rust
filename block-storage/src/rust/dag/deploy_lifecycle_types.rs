@@ -80,6 +80,7 @@ pub struct TerminalRecord {
 pub struct DeployLifecycleTables {
     events: KeyValueTypedStoreImpl<ByteString, LifecycleEvents>,
     terminal: KeyValueTypedStoreImpl<ByteString, TerminalRecord>,
+    dropped: Arc<parking_lot::Mutex<Vec<ByteString>>>,
 }
 
 impl DeployLifecycleTables {
@@ -87,6 +88,7 @@ impl DeployLifecycleTables {
         Self {
             events: KeyValueTypedStoreImpl::new(events_kv),
             terminal: KeyValueTypedStoreImpl::new(terminal_kv),
+            dropped: Arc::default(),
         }
     }
 
@@ -96,8 +98,23 @@ impl DeployLifecycleTables {
         Self {
             events: KeyValueTypedStoreImpl::new(Arc::new(InMemoryKeyValueStore::new())),
             terminal: KeyValueTypedStoreImpl::new(Arc::new(InMemoryKeyValueStore::new())),
+            dropped: Arc::default(),
         }
     }
+
+    pub fn open_dropped(&self, sig: &[u8], valid_after: i64) -> Result<bool, KvStoreError> {
+        if self.get_terminal(sig)?.is_some() || self.get_events(sig)?.is_some() {
+            return Ok(false);
+        }
+        self.events.put_one(sig.to_vec(), LifecycleEvents {
+            valid_after: Some(valid_after),
+            events: Vec::new(),
+        })?;
+        self.dropped.lock().push(sig.to_vec());
+        Ok(true)
+    }
+
+    pub fn take_dropped(&self) -> Vec<ByteString> { std::mem::take(&mut *self.dropped.lock()) }
 
     pub fn get_events(&self, sig: &[u8]) -> Result<Option<LifecycleEvents>, KvStoreError> {
         let results = self.events.get(&vec![sig.to_vec()])?;
@@ -233,6 +250,42 @@ mod tests {
             latest_height: 9,
             latest_block_hash: vec![9; 32],
         }
+    }
+
+    #[test]
+    fn open_dropped_opens_only_an_unknown_sig_and_queues_it() {
+        let tables = DeployLifecycleTables::in_memory();
+        assert!(tables.open_dropped(b"new", 7).expect("open"));
+        assert_eq!(
+            tables.get_events(b"new").expect("read"),
+            Some(LifecycleEvents {
+                valid_after: Some(7),
+                events: Vec::new(),
+            })
+        );
+        assert!(!tables.open_dropped(b"new", 9).expect("reopen"));
+
+        tables
+            .append_events(b"seen", Some(3), vec![included(4, false)])
+            .expect("append");
+        assert!(!tables.open_dropped(b"seen", 3).expect("open seen"));
+        assert_eq!(
+            tables
+                .get_events(b"seen")
+                .expect("read")
+                .expect("row")
+                .events,
+            vec![included(4, false)]
+        );
+
+        tables
+            .put_terminal_if_absent(b"done", terminal(TerminalState::Finalized))
+            .expect("terminal");
+        assert!(!tables.open_dropped(b"done", 1).expect("open done"));
+        assert!(tables.get_events(b"done").expect("read").is_none());
+
+        assert_eq!(tables.take_dropped(), vec![b"new".to_vec()]);
+        assert!(tables.take_dropped().is_empty());
     }
 
     #[test]

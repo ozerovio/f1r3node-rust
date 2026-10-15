@@ -1443,6 +1443,18 @@ async fn prepare_user_deploys_with_policy(
             all_expired.len()
         );
         let expired_list: Vec<Signed<DeployData>> = all_expired.into_iter().cloned().collect();
+        for deploy in &expired_list {
+            if let Err(err) = casper_snapshot.dag.open_dropped_deploy_lifecycle_row(
+                &deploy.sig,
+                deploy.data.valid_after_block_number,
+            ) {
+                tracing::warn!(
+                    "Failed to open a lifecycle row for expired deploy {}...: {}",
+                    deploy_sig_prefix(&deploy.sig),
+                    err
+                );
+            }
+        }
         deploy_storage_guard.remove(expired_list.clone())?;
 
         // Also purge expired sigs from the rejected-deploy buffer.

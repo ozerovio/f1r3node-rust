@@ -393,6 +393,9 @@ impl DeployLifecycle {
         for rd in &block.body.rejected_deploys {
             due.insert(rd.sig.clone());
         }
+        for sig in dag.take_dropped_lifecycle_sigs() {
+            due.insert(Bytes::from(sig));
+        }
         let floor_height = schedule
             .max_floor
             .as_ref()
@@ -473,6 +476,21 @@ fn evaluate(
     let Some(valid_after) = row.valid_after else {
         return Ok(());
     };
+
+    if row.events.is_empty() {
+        let Some(bound) = citability_horizon else {
+            return Ok(());
+        };
+        let decide_at = valid_after + deploy_lifespan + bound;
+        if floor_height <= decide_at {
+            schedule
+                .floor_thresholds
+                .entry(decide_at + 1)
+                .or_default()
+                .insert(sig.clone());
+            return Ok(());
+        }
+    }
 
     // FINALIZED AT COVERAGE. Membership at the floor is monotone (a
     // floor-covered effect is in every future merge base), so the first
@@ -814,6 +832,119 @@ mod tests {
             vec![sig],
             "adoption of a covering LFB must land the Finalized verdict"
         );
+    }
+
+    fn block_carrying(
+        height: i64,
+        parents: Vec<BlockHash>,
+        seq: i32,
+        deploys: Vec<models::rust::casper::protocol::casper_message::ProcessedDeploy>,
+    ) -> BlockMessage {
+        get_random_block(
+            Some(height),
+            Some(seq),
+            None,
+            None,
+            None,
+            None,
+            Some(i64::from(seq)),
+            Some(parents),
+            Some(Vec::new()),
+            Some(deploys),
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some("test-shard".to_string()),
+            None,
+        )
+    }
+
+    async fn dropped_deploy_verdict(
+        carry_at: Option<i64>,
+    ) -> (Bytes, Vec<Bytes>, Vec<Bytes>, Option<TerminalState>) {
+        use block_storage::rust::dag::block_dag_key_value_storage::{
+            BlockDagKeyValueStorage, InsertMode,
+        };
+
+        let mut kvm = InMemoryStoreManager::new();
+        let block_store = KeyValueBlockStore::create_from_kvm(&mut kvm)
+            .await
+            .expect("block store");
+        let dag_storage = BlockDagKeyValueStorage::new(&mut kvm)
+            .await
+            .expect("dag storage");
+        let (sig, pd) = processed(1, false);
+        let valid_after = pd.deploy.data.valid_after_block_number;
+
+        let genesis = block_at(0, Vec::new(), 0);
+        block_store
+            .put_block_message(&genesis)
+            .expect("store genesis");
+        dag_storage
+            .insert(&genesis, InsertMode::Approved)
+            .expect("insert genesis");
+        dag_storage
+            .get_representation()
+            .expect("dag")
+            .open_dropped_deploy_lifecycle_row(&sig, valid_after)
+            .expect("open dropped row");
+
+        let mut chain = vec![genesis];
+        for height in 1..=6 {
+            let parents = vec![chain.last().expect("parent").block_hash.clone()];
+            let deploys = if carry_at == Some(height) {
+                vec![pd.clone()]
+            } else {
+                Vec::new()
+            };
+            let block = block_carrying(height, parents, height as i32, deploys);
+            block_store.put_block_message(&block).expect("store block");
+            dag_storage
+                .insert(&block, InsertMode::Normal)
+                .expect("insert block");
+            chain.push(block);
+        }
+
+        let register = DeployLifecycle::default();
+        dag_storage
+            .record_directly_finalized(chain[3].block_hash.clone(), 0.5, |_| async { Ok(()) })
+            .await
+            .expect("adopt height 3");
+        let dag = dag_storage.get_representation().expect("dag");
+        let before_bound = register
+            .observe_block(&dag, &block_store, &chain[4], 2, Some(2))
+            .await
+            .expect("observe height 4");
+
+        dag_storage
+            .record_directly_finalized(chain[5].block_hash.clone(), 0.5, |_| async { Ok(()) })
+            .await
+            .expect("adopt height 5");
+        let dag = dag_storage.get_representation().expect("dag");
+        let past_bound = register
+            .observe_block(&dag, &block_store, &chain[6], 2, Some(2))
+            .await
+            .expect("observe height 6");
+        let verdict = dag
+            .deploy_terminal(&sig)
+            .expect("terminal lookup")
+            .map(|record| record.state);
+        (sig, before_bound, past_bound, verdict)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_deploy_that_no_block_carried_expires_past_the_bound() {
+        let (sig, before_bound, past_bound, verdict) = dropped_deploy_verdict(None).await;
+        assert!(before_bound.is_empty());
+        assert_eq!(past_bound, vec![sig]);
+        assert_eq!(verdict, Some(TerminalState::Expired));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_deploy_that_another_block_carried_finalizes() {
+        let (sig, before_bound, past_bound, verdict) = dropped_deploy_verdict(Some(2)).await;
+        assert_eq!(before_bound, vec![sig.clone()]);
+        assert!(past_bound.is_empty());
+        assert_eq!(verdict, Some(TerminalState::Finalized));
     }
 
     /// A sig with BOTH a floor-covered failed execution and a later clean
