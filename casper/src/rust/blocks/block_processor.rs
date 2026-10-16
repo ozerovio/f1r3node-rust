@@ -945,11 +945,35 @@ impl<T: TransportLayer + Send + Sync + 'static> BlockProcessorDependencies<T> {
         self.casper_buffer_last_prune_ms
             .store(now_ms, Ordering::Relaxed);
 
+        let dag = self.block_dag_storage.get_representation()?;
+        let invalid: HashSet<BlockHash> = dag.invalid_blocks_map()?.into_keys().collect();
+        let equivocations: HashSet<BlockHash> = self
+            .block_dag_storage
+            .access_equivocations_tracker(|tracker| {
+                Ok(tracker
+                    .data()?
+                    .iter()
+                    .flat_map(|record| record.equivocation_detected_block_hashes.iter())
+                    .cloned()
+                    .collect())
+            })?;
+        let is_ready =
+            |hash: &BlockHashSerde| match self.block_store.get(&BlockHash::from(hash.0.clone())) {
+                Ok(Some(block)) => proto_util::dependencies_hashes_of(&block)
+                    .iter()
+                    .all(|dep| {
+                        dag.contains(dep) || equivocations.contains(dep) || invalid.contains(dep)
+                    }),
+                Ok(None) => false,
+                Err(_) => true,
+            };
+
         let (stale_hashes, overflow_hashes) = self.casper_buffer.enforce_limits(
             CASPER_BUFFER_MAX_APPROX_NODES,
             CASPER_BUFFER_STALE_TTL_MS,
             CASPER_BUFFER_MAX_PRUNE_BATCH,
             prune_interval_ms,
+            is_ready,
         )?;
         let (stale_pruned, overflow_pruned) = (stale_hashes.len(), overflow_hashes.len());
         for hash in stale_hashes.iter().chain(overflow_hashes.iter()) {
