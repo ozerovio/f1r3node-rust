@@ -225,3 +225,125 @@ async fn overflow_prune_preserves_the_retry_quarantine() {
         MAX_RETRIES_PER_HASH
     );
 }
+
+#[tokio::test]
+async fn overflow_prune_keeps_a_child_released_before_the_prune_lock() {
+    use block_storage::rust::dag::equivocation_tracker_store::EquivocationTrackerStore;
+    use rspace_plus_plus::rspace::shared::key_value_store_manager::KeyValueStoreManager;
+    use shared::rust::store::key_value_typed_store_impl::KeyValueTypedStoreImpl;
+
+    let mut fixture = Fixture::new().await;
+    let original_dag = &fixture.dependencies.block_dag_storage;
+    let genesis_hash = original_dag
+        .get_representation()
+        .unwrap()
+        .last_finalized_block();
+    let global_lock = Arc::new(parking_lot::RwLock::new(()));
+    let mut kvm = InMemoryStoreManager::new();
+    let dag = BlockDagKeyValueStorage::from_parts(
+        global_lock.clone(),
+        KeyValueTypedStoreImpl::new(kvm.store("latest-messages".to_string()).await.unwrap()),
+        original_dag.metadata_index_for_tests(),
+        KeyValueTypedStoreImpl::new(kvm.store("invalid-blocks".to_string()).await.unwrap()),
+        original_dag.floor_index_for_tests().clone(),
+        original_dag.frontier_index_for_tests().clone(),
+        EquivocationTrackerStore::new(KeyValueTypedStoreImpl::new(
+            kvm.store("equivocation-tracker".to_string()).await.unwrap(),
+        )),
+        Arc::new(AtomicU64::new(original_dag.current_generation())),
+    );
+    fixture.dependencies.block_dag_storage = dag.clone();
+
+    let mut parent = get_random_block(
+        Some(1),
+        Some(1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(vec![genesis_hash]),
+        Some(vec![]),
+        None,
+        None,
+        Some(vec![]),
+        None,
+        None,
+    );
+    parent.block_hash = fixture.parent.clone();
+    let mut child = parent.clone();
+    child.block_hash = fixture.child.clone();
+    child.header.parents_hash_list = vec![parent.block_hash.clone()];
+    child.body.state.block_number = 2;
+    child.seq_num = 2;
+    fixture
+        .dependencies
+        .block_store
+        .put_block_message(&parent)
+        .unwrap();
+    fixture
+        .dependencies
+        .block_store
+        .put_block_message(&child)
+        .unwrap();
+
+    let metadata = dag.metadata_index_for_tests();
+    let metadata_guard = metadata.write();
+    let pruner = {
+        let dependencies = fixture.dependencies.clone();
+        std::thread::spawn(move || dependencies.enforce_casper_buffer_limit(0))
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pruning_holds_dag_lock = false;
+    while Instant::now() < deadline && !pruner.is_finished() {
+        if global_lock.try_write().is_none() {
+            pruning_holds_dag_lock = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    let admission = {
+        let buffer = fixture.dependencies.casper_buffer.clone();
+        std::thread::spawn(move || {
+            use block_storage::rust::dag::buffer_dag_transition::{
+                atomic_insert_then_buffer, BufferTransition,
+            };
+
+            let transition =
+                BufferTransition::RemoveFromBuffer(BlockHashSerde(parent.block_hash.clone()));
+            atomic_insert_then_buffer(&dag, &parent, InsertMode::Normal, &buffer, transition)
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut writer_blocks_new_readers = false;
+    while Instant::now() < deadline {
+        if global_lock.try_read().is_none() {
+            writer_blocks_new_readers = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    drop(metadata_guard);
+    let admission = admission.join().unwrap();
+    let pruning = pruner.join().unwrap();
+
+    assert!(
+        pruning_holds_dag_lock,
+        "Pruning must acquire the DAG lock before it reads metadata"
+    );
+    assert!(
+        writer_blocks_new_readers,
+        "A DAG writer must exclude new readers"
+    );
+    admission.unwrap();
+    pruning.unwrap();
+    assert!(fixture
+        .dependencies
+        .casper_buffer
+        .is_pendant(&BlockHashSerde(fixture.child.clone())));
+    assert_eq!(fixture.dependencies.casper_buffer.take_released(), vec![
+        BlockHashSerde(fixture.child)
+    ]);
+}
