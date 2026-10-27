@@ -13,7 +13,7 @@ use shared::rust::store::key_value_typed_store_impl::KeyValueTypedStoreImpl;
 use shared::rust::store::lmdb_key_value_store::LmdbKeyValueStore;
 use shared::rust::ByteString;
 
-use super::deploy_record_quarantine::DeployRecordQuarantine;
+use super::deploy_record_quarantine::{DeployRecordQuarantine, VerifiedMetadata};
 
 pub const DEPLOY_STORAGE_DB: &str = "deploy_storage";
 pub const DEPLOY_STORAGE_QUARANTINE_DB: &str = "deploy_storage_quarantine";
@@ -63,9 +63,19 @@ pub(super) struct MetadataCache {
     pub revision: Option<usize>,
     pub initialized: bool,
     pub snapshot: MetadataSnapshot,
+    verified: std::collections::HashMap<ByteString, VerifiedMetadata>,
 }
 
 impl MetadataCache {
+    fn compact_verified(&mut self) {
+        let len = self.verified.len();
+        if self.verified.is_empty() {
+            self.verified.shrink_to_fit();
+        } else if self.verified.capacity() > len.saturating_mul(4).max(128) {
+            self.verified.shrink_to(len.saturating_mul(2));
+        }
+    }
+
     pub fn update(
         &mut self,
         before: Option<usize>,
@@ -74,6 +84,15 @@ impl MetadataCache {
         additions: Vec<DeployMetadata>,
         removals: Vec<Vec<u8>>,
     ) {
+        if writes > 0 {
+            for deploy in &additions {
+                self.verified.remove(&deploy.signature);
+            }
+            for signature in &removals {
+                self.verified.remove(signature);
+            }
+            self.compact_verified();
+        }
         let trusted = self.initialized
             && before.is_some()
             && before == self.revision
@@ -170,35 +189,40 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
 
     pub fn metadata_snapshot(&self) -> Result<MetadataSnapshot, KvStoreError> {
         let mut cache = self.metadata.lock();
-        for _ in 0..3 {
-            let before = store_revision(self.store.raw_store());
-            if cache.initialized && before.is_some() && cache.revision == before {
-                return Ok(cache.snapshot.clone());
-            }
-            let entries: imbl::HashMap<_, _> = self
-                .read_all()?
-                .iter()
-                .map(|deploy| (deploy.sig.to_vec(), DeployMetadata::from(deploy)))
-                .collect();
-            let after = store_revision(self.store.raw_store());
-            if before != after {
-                continue;
-            }
-            if !cache.initialized || entries != cache.snapshot.entries {
-                cache.snapshot.generation = cache.snapshot.generation.wrapping_add(1);
-                cache.snapshot.entries = entries;
-            }
-            cache.snapshot.parent_generation = None;
-            cache.snapshot.additions.clear();
-            cache.snapshot.removals.clear();
-            cache.initialized = true;
-            cache.revision = after;
+        let before = store_revision(self.store.raw_store());
+        if cache.initialized && before.is_some() && cache.revision == before {
             return Ok(cache.snapshot.clone());
         }
-        cache.revision = None;
-        Err(KvStoreError::InvalidArgument(
-            "Deploy storage changed during metadata refresh".into(),
-        ))
+        let (entries, decoded) = self
+            .quarantine
+            .read_metadata(&self.store, &mut cache.verified)?;
+        cache.compact_verified();
+        metrics::gauge!(DEPLOY_STORE_SIZE_METRIC, "store" => N::NAME).set(entries.len() as f64);
+        if decoded > 0 {
+            metrics::counter!(DEPLOY_STORE_READ_ALL_DECODED_METRIC, "store" => N::NAME)
+                .increment(decoded as u64);
+        }
+        if let Some(limit) = N::SIZE_WARNING_THRESHOLD {
+            if entries.len() > limit {
+                tracing::warn!(
+                    store = N::NAME,
+                    size = entries.len(),
+                    limit,
+                    "deploy store above size warning threshold"
+                );
+            }
+        }
+        let after = store_revision(self.store.raw_store());
+        if !cache.initialized || entries != cache.snapshot.entries {
+            cache.snapshot.generation = cache.snapshot.generation.wrapping_add(1);
+            cache.snapshot.entries = entries;
+        }
+        cache.snapshot.parent_generation = None;
+        cache.snapshot.additions.clear();
+        cache.snapshot.removals.clear();
+        cache.initialized = true;
+        cache.revision = before.filter(|revision| Some(*revision) == after);
+        Ok(cache.snapshot.clone())
     }
 
     pub fn add(&self, deploys: Vec<Signed<DeployData>>) -> Result<(), KvStoreError> {
@@ -628,6 +652,284 @@ mod tests {
                 .await
                 .unwrap();
             KeyValueDeployStorage::from_stores(store, quarantine).unwrap()
+        }
+
+        thread_local! {
+            static ON_DECODE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        struct DecodeHook;
+
+        impl DecodeHook {
+            fn install(pool: &mut KeyValueDeployStorage, hook: impl FnMut() + 'static) -> Self {
+                use shared::rust::store::key_value_typed_store_impl::KeyValueTypedStoreImpl;
+
+                use crate::rust::deploy::deploy_codec;
+
+                ON_DECODE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    assert!(slot.is_none());
+                    *slot = Some(Box::new(hook));
+                });
+                pool.store = KeyValueTypedStoreImpl::with_value_codec(
+                    pool.store.raw_store().clone(),
+                    deploy_codec::encode,
+                    |bytes| {
+                        let deploy = deploy_codec::decode(bytes)?;
+                        ON_DECODE.with(|slot| {
+                            if let Some(hook) = slot.borrow_mut().as_mut() {
+                                hook();
+                            }
+                        });
+                        Ok(deploy)
+                    },
+                );
+                Self
+            }
+        }
+
+        impl Drop for DecodeHook {
+            fn drop(&mut self) { ON_DECODE.with(|slot| *slot.borrow_mut() = None); }
+        }
+
+        #[tokio::test]
+        async fn unrelated_writes_reuse_verified_records_without_decoding_again() {
+            use std::cell::Cell;
+            use std::rc::Rc;
+            use std::sync::Arc;
+
+            use shared::rust::store::key_value_store::KeyValueStore;
+            use shared::rust::store::lmdb_key_value_store::LmdbKeyValueStore;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut pool = storage(dir.path()).await;
+            let first = deploy(1);
+            pool.add(vec![first.clone()]).unwrap();
+
+            let store = pool
+                .store
+                .raw_store()
+                .as_any()
+                .downcast_ref::<LmdbKeyValueStore>()
+                .unwrap();
+            let mut txn = store.env.write_txn().unwrap();
+            let db = store
+                .env
+                .create_database(&mut txn, Some("unrelated"))
+                .unwrap();
+            txn.commit().unwrap();
+            let unrelated = Arc::new(LmdbKeyValueStore {
+                env: store.env.clone(),
+                db,
+            });
+            let writes = Rc::new(Cell::new(0_u64));
+            let observed = writes.clone();
+            let mutation = unrelated.clone();
+            let _hook = DecodeHook::install(&mut pool, move || {
+                let next = observed.get() + 1;
+                mutation
+                    .put(vec![(b"key".to_vec(), next.to_be_bytes().to_vec())])
+                    .unwrap();
+                observed.set(next);
+            });
+
+            let first_snapshot = pool.metadata_snapshot().unwrap();
+            for index in 100_u64..103 {
+                unrelated
+                    .put(vec![(b"key".to_vec(), index.to_be_bytes().to_vec())])
+                    .unwrap();
+                let snapshot = pool.metadata_snapshot().unwrap();
+                assert_eq!(snapshot.entries, first_snapshot.entries);
+                assert_eq!(snapshot.generation, first_snapshot.generation);
+                assert!(snapshot.entries.contains_key(&first.sig.to_vec()));
+            }
+            assert_eq!(writes.get(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_changed_raw_record_is_decoded_before_reusing_metadata() {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut pool = storage(dir.path()).await;
+            let independent = storage(dir.path()).await;
+            let first = deploy(1);
+            let second = deploy(2);
+            pool.add(vec![first.clone()]).unwrap();
+            let decodes = Rc::new(Cell::new(0));
+            let observed = decodes.clone();
+            let _hook = DecodeHook::install(&mut pool, move || observed.set(observed.get() + 1));
+            let initial = pool.metadata_snapshot().unwrap();
+            assert_eq!(decodes.get(), 1);
+
+            independent
+                .store
+                .put_one(first.sig.to_vec(), second.clone())
+                .unwrap();
+            let changed = pool.metadata_snapshot().unwrap();
+            assert_eq!(decodes.get(), 2);
+            assert_ne!(changed.generation, initial.generation);
+            assert!(!changed.entries.contains_key(&first.sig.to_vec()));
+            assert!(changed.entries.contains_key(&second.sig.to_vec()));
+
+            let temporary = deploy(3);
+            independent.add(vec![temporary.clone()]).unwrap();
+            independent.remove_by_sig(&temporary.sig).unwrap();
+            assert_eq!(pool.metadata_snapshot().unwrap().entries, changed.entries);
+            assert_eq!(decodes.get(), 2);
+        }
+
+        #[tokio::test]
+        async fn tampering_with_a_verified_record_still_quarantines_it() {
+            use std::sync::Arc;
+
+            use rspace_plus_plus::rspace::shared::in_mem_key_value_store::InMemoryKeyValueStore;
+            use shared::rust::store::key_value_store::KeyValueStore;
+
+            let dir = tempfile::tempdir().unwrap();
+            let persistent = storage(dir.path()).await;
+            let quarantine = Arc::new(InMemoryKeyValueStore::new());
+            let pool = KeyValueDeployStorage::from_stores(
+                persistent.store.raw_store().clone(),
+                quarantine.clone(),
+            )
+            .unwrap();
+            let first = deploy(1);
+            pool.add(vec![first.clone()]).unwrap();
+            assert_eq!(pool.metadata_snapshot().unwrap().entries.len(), 1);
+            let mut tampered = first.clone();
+            tampered.data.time_stamp += 1;
+            persistent
+                .store
+                .put_one(first.sig.to_vec(), tampered.clone())
+                .unwrap();
+            let key = pool.store.encode_key(&first.sig.to_vec()).unwrap();
+            let bytes = pool.store.encode_value(&tampered).unwrap();
+
+            assert!(pool.metadata_snapshot().unwrap().entries.is_empty());
+            assert!(!pool.contains_sig(&first.sig).unwrap());
+            assert_eq!(quarantine.get_one(&key).unwrap(), Some(bytes));
+            assert!(pool.metadata.lock().verified.is_empty());
+        }
+
+        #[tokio::test]
+        async fn known_deletions_evict_verified_records_without_accumulating_history() {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = storage(dir.path()).await;
+            let independent = storage(dir.path()).await;
+            for round in 0..3 {
+                let deploys: Vec<_> = (0..32).map(|i| deploy(round * 32 + i)).collect();
+                pool.add(deploys.clone()).unwrap();
+                independent
+                    .store
+                    .put_one(deploys[0].sig.to_vec(), deploys[0].clone())
+                    .unwrap();
+                pool.metadata_snapshot().unwrap();
+                assert_eq!(pool.metadata.lock().verified.len(), 32);
+                pool.remove(deploys).unwrap();
+                assert!(pool.metadata.lock().verified.is_empty());
+                assert_eq!(pool.metadata.lock().verified.capacity(), 0);
+                assert!(pool.metadata_snapshot().unwrap().entries.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn a_sparse_verified_cache_shrinks_and_preserves_remaining_records() {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut pool = storage(dir.path()).await;
+            let independent = storage(dir.path()).await;
+            let deploys: Vec<_> = (0..256).map(deploy).collect();
+            pool.add(deploys.clone()).unwrap();
+            pool.metadata_snapshot().unwrap();
+            let before = pool.metadata.lock().verified.capacity();
+            pool.remove(deploys[..240].to_vec()).unwrap();
+            {
+                let cache = pool.metadata.lock();
+                assert_eq!(cache.verified.len(), 16);
+                assert!(cache.verified.capacity() < before);
+                assert!(cache.verified.capacity() <= 4 * cache.verified.len());
+            }
+            let decodes = Rc::new(Cell::new(0));
+            let observed = decodes.clone();
+            let _hook = DecodeHook::install(&mut pool, move || observed.set(observed.get() + 1));
+            independent
+                .store
+                .put_one(deploys[240].sig.to_vec(), deploys[240].clone())
+                .unwrap();
+            let snapshot = pool.metadata_snapshot().unwrap();
+            assert_eq!(snapshot.entries.len(), 16);
+            for deploy in &deploys[240..] {
+                assert!(snapshot.entries.contains_key(&deploy.sig.to_vec()));
+            }
+            assert_eq!(decodes.get(), 0);
+        }
+
+        #[tokio::test]
+        async fn metadata_refresh_releases_capacity_reserved_for_damaged_records() {
+            for keep_valid in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let pool = storage(dir.path()).await;
+                if keep_valid {
+                    pool.add(vec![deploy(1)]).unwrap();
+                }
+                let damaged = (0_u8..128)
+                    .map(|index| (bincode::serialize(&vec![index; 64]).unwrap(), vec![255]))
+                    .collect();
+                pool.store.raw_store().put(damaged).unwrap();
+                let snapshot = pool.metadata_snapshot().unwrap();
+                let expected = usize::from(keep_valid);
+                assert_eq!(snapshot.entries.len(), expected);
+                let cache = pool.metadata.lock();
+                assert_eq!(cache.verified.len(), expected);
+                if keep_valid {
+                    assert!(cache.verified.capacity() <= 4);
+                } else {
+                    assert_eq!(cache.verified.capacity(), 0);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn metadata_refresh_detects_pool_changes_during_decode() {
+            let dir = tempfile::tempdir().unwrap();
+            for insert in [true, false] {
+                let case = dir.path().join(if insert { "insert" } else { "remove" });
+                std::fs::create_dir(&case).unwrap();
+                let mut pool = storage(&case).await;
+                let independent = storage(&case).await;
+                let first = deploy(1);
+                let second = deploy(2);
+                pool.add(vec![first.clone()]).unwrap();
+                let signature = first.sig.clone();
+                let mut change = Some(second.clone());
+                let hook = DecodeHook::install(&mut pool, move || {
+                    if let Some(deploy) = change.take() {
+                        if insert {
+                            independent.add(vec![deploy]).unwrap();
+                        } else {
+                            independent.remove_by_sig(&signature).unwrap();
+                        }
+                    }
+                });
+
+                let initial = pool.metadata_snapshot().unwrap();
+                let refreshed = pool.metadata_snapshot().unwrap();
+                assert_eq!(refreshed.entries.len(), if insert { 2 } else { 0 });
+                assert_eq!(refreshed.entries.contains_key(&second.sig.to_vec()), insert);
+                if initial.entries != refreshed.entries {
+                    assert_ne!(initial.generation, refreshed.generation);
+                }
+                assert_eq!(
+                    pool.metadata_snapshot().unwrap().generation,
+                    refreshed.generation
+                );
+                drop(hook);
+            }
         }
 
         #[tokio::test]
