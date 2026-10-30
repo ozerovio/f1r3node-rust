@@ -19,6 +19,8 @@ pub const DEPLOY_STORAGE_DB: &str = "deploy_storage";
 pub const DEPLOY_STORAGE_QUARANTINE_DB: &str = "deploy_storage_quarantine";
 pub const REJECTED_DEPLOY_BUFFER_DB: &str = "rejected_deploy_buffer";
 pub const REJECTED_DEPLOY_BUFFER_QUARANTINE_DB: &str = "rejected_deploy_buffer_quarantine";
+pub const DEPLOY_STORAGE_VERIFIED_DB: &str = "deploy_storage_verified";
+pub const REJECTED_DEPLOY_BUFFER_VERIFIED_DB: &str = "rejected_deploy_buffer_verified";
 
 const DEPLOY_STORE_SIZE_METRIC: &str = "deploy.store.size";
 const DEPLOY_STORE_READ_ALL_DECODED_METRIC: &str = "deploy-store.read-all.decoded";
@@ -110,20 +112,39 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
     pub async fn new(kvm: &mut impl KeyValueStoreManager) -> Result<Self, KvStoreError> {
         let kv_store = kvm.store(N::NAME.to_string()).await?;
         let quarantine_kv_store = kvm.store(N::QUARANTINE_NAME.to_string()).await?;
-        Self::from_stores(kv_store, quarantine_kv_store)
+        let verified_kv_store = match kvm.store(format!("{}_verified", N::NAME)).await {
+            Ok(store) => Some(store),
+            Err(error) => {
+                tracing::warn!(store = N::NAME, %error, "Could not open deploy verification evidence; signature checks remain enabled");
+                None
+            }
+        };
+        Self::from_stores_with_verification(kv_store, quarantine_kv_store, verified_kv_store)
     }
 
     pub fn from_stores(
         store: Arc<dyn KeyValueStore>,
         quarantine: Arc<dyn KeyValueStore>,
     ) -> Result<Self, KvStoreError> {
+        Self::from_stores_with_verification(store, quarantine, None)
+    }
+
+    pub(super) fn from_stores_with_verification(
+        store: Arc<dyn KeyValueStore>,
+        quarantine: Arc<dyn KeyValueStore>,
+        verified: Option<Arc<dyn KeyValueStore>>,
+    ) -> Result<Self, KvStoreError> {
+        let mut quarantine = DeployRecordQuarantine::new(N::NAME, quarantine);
+        if let Some(verified) = verified {
+            quarantine = quarantine.with_verified_store(verified);
+        }
         let storage = Self {
             store: KeyValueTypedStoreImpl::with_value_codec(
                 store,
                 super::deploy_codec::encode,
                 super::deploy_codec::decode,
             ),
-            quarantine: DeployRecordQuarantine::new(N::NAME, quarantine),
+            quarantine,
             _name: PhantomData,
         };
         storage.quarantine.restore_readable(&storage.store)?;
@@ -176,9 +197,11 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
             })
             .unzip();
         self.store.raw_store().put(records)?;
-        for (key, fingerprint) in verified {
-            self.quarantine.remember_verified(key, fingerprint);
+        for (key, fingerprint) in &verified {
+            self.quarantine
+                .remember_verified(key.clone(), fingerprint.clone());
         }
+        self.quarantine.persist_verified(verified);
         Ok(())
     }
 
@@ -192,7 +215,9 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
             .put_one_if_absent(deploy.key.clone(), deploy.value)?;
         if inserted {
             self.quarantine
-                .remember_verified(deploy.key, deploy.fingerprint);
+                .remember_verified(deploy.key.clone(), deploy.fingerprint.clone());
+            self.quarantine
+                .persist_verified(vec![(deploy.key, deploy.fingerprint)]);
         } else if !self.quarantine.contains(&self.store, &deploy.key)? {
             return Err(KvStoreError::InvalidArgument(
                 "Deploy insertion was blocked by an invalid or concurrently changed record"
@@ -253,7 +278,9 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
             .put_one_if_absent(deploy.key.clone(), deploy.value)?;
         if inserted {
             self.quarantine
-                .remember_verified(deploy.key, deploy.fingerprint);
+                .remember_verified(deploy.key.clone(), deploy.fingerprint.clone());
+            self.quarantine
+                .persist_verified(vec![(deploy.key, deploy.fingerprint)]);
         }
         Ok(if inserted {
             PreparedInsertResult::Inserted
@@ -274,9 +301,7 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
             .map(|deploy| self.store.encode_key(&deploy.sig.to_vec()))
             .collect::<Result<Vec<_>, _>>()?;
         self.store.raw_store().delete(keys.clone())?;
-        for key in keys {
-            self.quarantine.forget(&key);
-        }
+        self.quarantine.forget_all(&keys);
         Ok(())
     }
 
@@ -284,7 +309,7 @@ impl<N: DeployStoreName> KeyValueDeployStore<N> {
         let key: ByteString = sig.to_vec();
         let key = self.store.encode_key(&key)?;
         let removed = self.store.raw_store().delete(vec![key.clone()])? > 0;
-        self.quarantine.forget(&key);
+        self.quarantine.forget_all(&[key]);
         Ok(removed)
     }
 
