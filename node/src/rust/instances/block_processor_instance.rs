@@ -51,6 +51,30 @@ pub(crate) fn resolve_pipeline_width() -> usize {
 
 struct ActiveBlockProcessingGuard;
 
+async fn verify_buffer_pendant<T: TransportLayer + Send + Sync + 'static>(
+    processor: &BlockProcessor<T>,
+    pendant: &BlockMessage,
+) -> Result<Option<VerifiedBlock>, CasperError> {
+    let block = pendant.clone();
+    let result = tokio::task::spawn_blocking(move || VerifiedBlock::verify(block))
+        .await
+        .map_err(|error| {
+            CasperError::RuntimeError(format!("Pendant verification task failed: {error}"))
+        })?;
+    match result {
+        Ok(verified) => Ok(Some(verified)),
+        Err(error) => {
+            tracing::warn!(
+                hash = %PrettyPrinter::build_string_bytes(&pendant.block_hash),
+                ?error,
+                "Removing dependency-free pendant with invalid hash or signature"
+            );
+            processor.purge_from_buffer_and_ack(pendant).await?;
+            Ok(None)
+        }
+    }
+}
+
 impl ActiveBlockProcessingGuard {
     fn new() -> Self {
         metrics::gauge!(
@@ -271,13 +295,9 @@ impl<T: TransportLayer + Send + Sync + 'static> BlockProcessorInstance<T> {
                                 }
                                 match mark_in_flight(&blocks_in_processing, pendant_hash.clone()) {
                                     InFlightMark::Marked(guard) => {
-                                        let block = pendant.clone();
-                                        match tokio::task::spawn_blocking(move || {
-                                            VerifiedBlock::verify(block)
-                                        })
-                                        .await
+                                        match verify_buffer_pendant(&block_processor, pendant).await
                                         {
-                                            Ok(Ok(verified)) => {
+                                            Ok(Some(verified)) => {
                                                 tracing::info!(
                                                     "Enqueued dependency-free pendant {}",
                                                     PrettyPrinter::build_string_bytes(
@@ -286,9 +306,11 @@ impl<T: TransportLayer + Send + Sync + 'static> BlockProcessorInstance<T> {
                                                 );
                                                 released.push((casper.clone(), verified, guard));
                                             }
-                                            _ => tracing::warn!(
-                                                "Dependency-free pendant {} does not match its hash or signature. Skipped.",
-                                                PrettyPrinter::build_string_bytes(&pendant.block_hash)
+                                            Ok(None) => {}
+                                            Err(error) => tracing::error!(
+                                                hash = %PrettyPrinter::build_string_bytes(&pendant.block_hash),
+                                                %error,
+                                                "Dependency-free pendant verification or cleanup failed"
                                             ),
                                         }
                                     }
@@ -916,6 +938,68 @@ mod tests {
     fn pipeline_width_uses_the_cpu_capacity() {
         for (cores, width) in [(6, 4), (8, 6), (16, 14), (32, 30)] {
             assert_eq!(derive_pipeline_width(cores), width);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_pendants_are_removed_from_the_buffer_and_retriever() {
+        use models::rust::block_hash::BlockHashSerde;
+
+        let identity =
+            ValidatorIdentity::new(&crypto::rust::private_key::PrivateKey::from_bytes(&[1; 32]));
+        for corrupt_hash in [true, false] {
+            let mut stores = InMemoryStoreManager::new();
+            let block_store = KeyValueBlockStore::create_from_kvm(&mut stores)
+                .await
+                .unwrap();
+            let buffer = CasperBufferKeyValueStorage::new_from_kvm(&mut stores)
+                .await
+                .unwrap();
+            let dag = BlockDagKeyValueStorage::new(&mut stores).await.unwrap();
+            let local = PeerNode::new(
+                NodeIdentifier {
+                    key: vec![1; 20].into(),
+                },
+                "localhost".to_string(),
+                40400,
+                40404,
+            );
+            let conf = create_rp_conf_ask(local, None, None);
+            let transport = Arc::new(TransportLayerStub::new());
+            let connections = ConnectionsCell::new();
+            let retriever = BlockRetriever::new(
+                Arc::new(Mutex::new(HashMap::new())),
+                transport.clone(),
+                connections.clone(),
+                conf.clone(),
+            );
+            let mut block = identity.sign_block(&get_random_block_default());
+            if corrupt_hash {
+                block.extra_bytes = Bytes::from_static(b"changed after signing");
+            } else {
+                block.sig = Bytes::new();
+            }
+            let hash = block.block_hash.clone();
+            buffer.put_pendant(BlockHashSerde(hash.clone())).unwrap();
+            retriever.ack_receive(hash.clone()).await.unwrap();
+            let processor = BlockProcessor::new(BlockProcessorDependencies::new(
+                block_store,
+                buffer.clone(),
+                dag,
+                retriever.clone(),
+                transport,
+                connections,
+                conf,
+                None,
+            ));
+
+            assert!(super::verify_buffer_pendant(&processor, &block)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!buffer.contains(&BlockHashSerde(hash.clone())));
+            assert!(!retriever.is_received(hash).await.unwrap());
+            assert_eq!(retriever.get_requested_blocks_count().await.unwrap(), 0);
         }
     }
 

@@ -373,6 +373,38 @@ impl std::ops::Deref for VerifiedBlock {
 pub enum ReceiptRefusal {
     Invalid(InvalidBlock),
     Overloaded,
+    AlreadyInFlight,
+    InFlightCapReached,
+}
+
+struct HashVerificationSlot {
+    users: usize,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+}
+
+type HashVerificationMap = dashmap::DashMap<BlockHash, HashVerificationSlot>;
+
+struct HashVerificationTicket {
+    entries: Arc<HashVerificationMap>,
+    hash: BlockHash,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for HashVerificationTicket {
+    fn drop(&mut self) {
+        self.guard.take();
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            self.entries.entry(self.hash.clone())
+        {
+            if Arc::ptr_eq(&entry.get().mutex, &self.mutex) {
+                entry.get_mut().users -= 1;
+                if entry.get().users == 0 {
+                    entry.remove();
+                }
+            }
+        }
+    }
 }
 
 struct PeerVerificationSlots {
@@ -430,6 +462,7 @@ pub struct ReceiptVerifier {
     next_generation: AtomicU64,
     active: Arc<AtomicUsize>,
     peak_active: Arc<AtomicUsize>,
+    by_hash: Arc<HashVerificationMap>,
 }
 
 impl ReceiptVerifier {
@@ -442,6 +475,7 @@ impl ReceiptVerifier {
             next_generation: AtomicU64::new(0),
             active: Arc::new(AtomicUsize::new(0)),
             peak_active: Arc::new(AtomicUsize::new(0)),
+            by_hash: Arc::new(HashVerificationMap::new()),
         }
     }
 
@@ -499,6 +533,41 @@ impl ReceiptVerifier {
         self.verify_with(peer, block, VerifiedBlock::verify).await
     }
 
+    pub async fn verify_and_mark(
+        &self,
+        peer: &prost::bytes::Bytes,
+        block: BlockMessage,
+        blocks: &Arc<InFlightBlocks>,
+    ) -> Result<(VerifiedBlock, InFlightBlockGuard), ReceiptRefusal> {
+        self.verify_and_mark_with(peer, block, blocks, VerifiedBlock::verify)
+            .await
+    }
+
+    async fn verify_and_mark_with<F>(
+        &self,
+        peer: &prost::bytes::Bytes,
+        block: BlockMessage,
+        blocks: &Arc<InFlightBlocks>,
+        check: F,
+    ) -> Result<(VerifiedBlock, InFlightBlockGuard), ReceiptRefusal>
+    where
+        F: FnOnce(BlockMessage) -> Result<VerifiedBlock, InvalidBlock> + Send + 'static,
+    {
+        if blocks.contains(&block.block_hash) {
+            return Err(ReceiptRefusal::AlreadyInFlight);
+        }
+        let processing = blocks.clone();
+        self.perform_verification(peer, block, Some(blocks.clone()), move |block| {
+            let verified = check(block).map_err(ReceiptRefusal::Invalid)?;
+            match mark_in_flight(&processing, verified.block_hash.clone()) {
+                InFlightMark::Marked(guard) => Ok((verified, guard)),
+                InFlightMark::AlreadyInFlight => Err(ReceiptRefusal::AlreadyInFlight),
+                InFlightMark::CapReached => Err(ReceiptRefusal::InFlightCapReached),
+            }
+        })
+        .await
+    }
+
     async fn verify_with<F>(
         &self,
         peer: &prost::bytes::Bytes,
@@ -507,6 +576,23 @@ impl ReceiptVerifier {
     ) -> Result<VerifiedBlock, ReceiptRefusal>
     where
         F: FnOnce(BlockMessage) -> Result<VerifiedBlock, InvalidBlock> + Send + 'static,
+    {
+        self.perform_verification(peer, block, None, move |block| {
+            check(block).map_err(ReceiptRefusal::Invalid)
+        })
+        .await
+    }
+
+    async fn perform_verification<R, F>(
+        &self,
+        peer: &prost::bytes::Bytes,
+        block: BlockMessage,
+        admission: Option<Arc<InFlightBlocks>>,
+        check: F,
+    ) -> Result<R, ReceiptRefusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(BlockMessage) -> Result<R, ReceiptRefusal> + Send + 'static,
     {
         let Ok(pending) = self.pending.clone().try_acquire_owned() else {
             return Err(ReceiptRefusal::Overloaded);
@@ -517,6 +603,33 @@ impl ReceiptVerifier {
             .try_acquire_owned()
             .map_err(|_| ReceiptRefusal::Overloaded)?;
         ticket.permits.push(peer_pending);
+        let hash_ticket = if let Some(blocks) = admission {
+            let hash = block.block_hash.clone();
+            let mutex = {
+                let mut slot =
+                    self.by_hash
+                        .entry(hash.clone())
+                        .or_insert_with(|| HashVerificationSlot {
+                            users: 0,
+                            mutex: Arc::new(tokio::sync::Mutex::new(())),
+                        });
+                slot.users += 1;
+                slot.mutex.clone()
+            };
+            let mut hash_ticket = HashVerificationTicket {
+                entries: self.by_hash.clone(),
+                hash: hash.clone(),
+                mutex,
+                guard: None,
+            };
+            hash_ticket.guard = Some(hash_ticket.mutex.clone().lock_owned().await);
+            if blocks.contains(&hash) {
+                return Err(ReceiptRefusal::AlreadyInFlight);
+            }
+            Some(hash_ticket)
+        } else {
+            None
+        };
         let peer_running = peer_running
             .acquire_owned()
             .await
@@ -534,15 +647,15 @@ impl ReceiptVerifier {
         let peak_active = self.peak_active.clone();
         tokio::task::spawn_blocking(move || {
             let _ticket = ticket;
+            let _hash_ticket = hash_ticket;
             let _active = ActiveVerification::start(active, &peak_active);
             check(block)
         })
         .await
         .unwrap_or_else(|join_error| {
             tracing::error!(error = %join_error, "block verification task failed");
-            Err(InvalidBlock::InvalidFormat)
+            Err(ReceiptRefusal::Invalid(InvalidBlock::InvalidFormat))
         })
-        .map_err(ReceiptRefusal::Invalid)
     }
 
     pub fn peak_active(&self) -> usize { self.peak_active.load(Ordering::Acquire) }
@@ -2528,6 +2641,123 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 8);
         assert!(mixed.peak_active() <= 2);
         assert_eq!(mixed.tracked_peers(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_copies_share_verification_but_a_forged_first_copy_does_not_claim_the_hash()
+    {
+        use crypto::rust::signatures::secp256k1::Secp256k1;
+        use crypto::rust::signatures::signatures_alg::SignaturesAlg;
+        use models::rust::block_implicits::get_random_block_default;
+
+        use crate::rust::validator_identity::ValidatorIdentity;
+
+        let (secret, _) = Secp256k1.new_key_pair();
+        let original = ValidatorIdentity::new(&secret).sign_block(&get_random_block_default());
+        for forged_first in [false, true] {
+            let verifier = Arc::new(ReceiptVerifier::new(2, 8, 4));
+            let blocks = Arc::new(InFlightBlocks::new());
+            let checks = Arc::new(AtomicUsize::new(0));
+            let mut first_block = original.clone();
+            if forged_first {
+                first_block.extra_bytes =
+                    prost::bytes::Bytes::from_static(b"changed after signing");
+            }
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = {
+                let verifier = verifier.clone();
+                let blocks = blocks.clone();
+                let checks = checks.clone();
+                tokio::spawn(async move {
+                    verifier
+                        .verify_and_mark_with(
+                            &prost::bytes::Bytes::from_static(b"first"),
+                            first_block,
+                            &blocks,
+                            move |block| {
+                                checks.fetch_add(1, Ordering::SeqCst);
+                                started_tx.send(()).expect("verification started");
+                                release_rx
+                                    .recv_timeout(Duration::from_secs(30))
+                                    .expect("release");
+                                VerifiedBlock::verify(block)
+                            },
+                        )
+                        .await
+                })
+            };
+            started_rx.await.expect("first verification started");
+            let second = {
+                let verifier = verifier.clone();
+                let blocks = blocks.clone();
+                let checks = checks.clone();
+                let original = original.clone();
+                tokio::spawn(async move {
+                    verifier
+                        .verify_and_mark_with(
+                            &prost::bytes::Bytes::from_static(b"second"),
+                            original,
+                            &blocks,
+                            move |block| {
+                                checks.fetch_add(1, Ordering::SeqCst);
+                                VerifiedBlock::verify(block)
+                            },
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while verifier.pending.available_permits() != 6 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("second copy admitted to bounded pending work");
+            let cancelled = {
+                let verifier = verifier.clone();
+                let blocks = blocks.clone();
+                let original = original.clone();
+                tokio::spawn(async move {
+                    verifier
+                        .verify_and_mark(
+                            &prost::bytes::Bytes::from_static(b"cancelled"),
+                            original,
+                            &blocks,
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while verifier.pending.available_permits() != 5 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled copy admitted to bounded pending work");
+            cancelled.abort();
+            assert!(cancelled.await.expect_err("cancelled task").is_cancelled());
+            assert_eq!(verifier.pending.available_permits(), 6);
+            release_tx.send(()).expect("release first verification");
+            let first = first.await.expect("first task");
+            let second = second.await.expect("second task");
+            if forged_first {
+                assert!(matches!(first, Err(ReceiptRefusal::Invalid(_))));
+                assert!(second.is_ok());
+                assert_eq!(checks.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(first.is_ok());
+                assert!(matches!(second, Err(ReceiptRefusal::AlreadyInFlight)));
+                assert_eq!(checks.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(blocks.len(), 1);
+            assert!(verifier.by_hash.is_empty());
+            assert_eq!(verifier.tracked_peers(), 0);
+            assert_eq!(verifier.pending.available_permits(), 8);
+            drop(first);
+            drop(second);
+            assert!(blocks.is_empty());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

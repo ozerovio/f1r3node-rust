@@ -283,14 +283,24 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                     );
                 } else {
                     let block_hash = b.block_hash.clone();
-                    let b = match ReceiptVerifier::shared().verify(&peer.id.key, b).await {
-                        Ok(verified) => verified,
+                    let (b, guard) = match ReceiptVerifier::shared()
+                        .verify_and_mark(&peer.id.key, b, &self.blocks_in_processing)
+                        .await
+                    {
+                        Ok(admitted) => admitted,
                         Err(ReceiptRefusal::Overloaded) => {
-                            metrics::counter!(
-                                crate::rust::metrics_constants::BLOCK_INFLIGHT_CAP_DROP_METRIC,
-                                "site" => "running-verification"
-                            )
-                            .increment(1);
+                            if self.block_retriever.awaits_block(&block_hash) {
+                                self.block_retriever.note_local_backpressure_drop(
+                                    &block_hash,
+                                    "running-verification",
+                                );
+                            } else {
+                                metrics::counter!(
+                                    crate::rust::metrics_constants::BLOCK_INFLIGHT_CAP_DROP_METRIC,
+                                    "site" => "running-verification"
+                                )
+                                .increment(1);
+                            }
                             tracing::debug!(
                                 "Dropping BlockMessage {} from {}: block verification is at capacity",
                                 PrettyPrinter::build_string_bytes(&block_hash),
@@ -306,23 +316,14 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                             );
                             return Ok(());
                         }
-                    };
-                    tracing::debug!(
-                        "Incoming BlockMessage {} from {}",
-                        PrettyPrinter::build_string_block_message(&b, true),
-                        peer.endpoint.host
-                    );
-                    let guard = match mark_in_flight(&self.blocks_in_processing, block_hash.clone())
-                    {
-                        InFlightMark::Marked(guard) => guard,
-                        InFlightMark::AlreadyInFlight => {
+                        Err(ReceiptRefusal::AlreadyInFlight) => {
                             tracing::debug!(
                                     "Skipping BlockMessage {} enqueue because it is already queued/in-processing",
                                     PrettyPrinter::build_string_bytes(&block_hash)
                                 );
                             return Ok(());
                         }
-                        InFlightMark::CapReached => {
+                        Err(ReceiptRefusal::InFlightCapReached) => {
                             self.block_retriever
                                 .note_local_backpressure_drop(&block_hash, "running-receipt");
                             tracing::warn!(
@@ -333,6 +334,11 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                             return Ok(());
                         }
                     };
+                    tracing::debug!(
+                        "Incoming BlockMessage {} from {}",
+                        PrettyPrinter::build_string_block_message(&b, true),
+                        peer.endpoint.host
+                    );
                     self.block_retriever.note_block_source(&block_hash, &peer)?;
                     self.block_processing_queue_tx
                         .send((self.casper.clone(), b, guard))
@@ -627,8 +633,7 @@ pub struct Running<T: TransportLayer + Send + Sync> {
 }
 
 use crate::rust::blocks::block_processor::{
-    mark_in_flight, BlockQueueItem, InFlightBlocks, InFlightMark, ReceiptRefusal, ReceiptVerifier,
-    MAX_BLOCKS_IN_PROCESSING,
+    BlockQueueItem, InFlightBlocks, ReceiptRefusal, ReceiptVerifier, MAX_BLOCKS_IN_PROCESSING,
 };
 
 impl<T: TransportLayer + Send + Sync> Running<T> {

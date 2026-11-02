@@ -22,8 +22,8 @@ use futures::stream::StreamExt;
 use models::rust::block_hash::BlockHash;
 use models::rust::casper::pretty_printer::PrettyPrinter;
 use models::rust::casper::protocol::casper_message::{
-    ApprovedBlock, BlockMessage, CasperMessage, FloorCacheResponse, MergeableEntryRequest,
-    MergeableEntryResponse, StoreItemsMessage, StoreItemsMessageRequest,
+    ApprovedBlock, BlockMessage, CasperMessage, FloorCacheResponse, MergeableEntryResponse,
+    StoreItemsMessage, StoreItemsMessageRequest,
 };
 use rspace_plus_plus::rspace::state::rspace_state_manager::RSpaceStateManager;
 use shared::rust::shared::f1r3fly_event::F1r3flyEvent;
@@ -850,8 +850,7 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
             &self.rp_conf_ask,
             self.block_store.clone(),
             Box::new(|block| self.validate_block(block)),
-        )
-        .with_runtime_manager(self.runtime_manager.clone());
+        );
 
         // Create empty queue for block requester (must be created outside tokio::join! for lifetime reasons)
         let empty_queue = VecDeque::new(); // Empty queue since we drained it above
@@ -931,6 +930,8 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
                 approved_block.candidate.block.clone(),
                 st.lower_bound,
                 st.height_map,
+                st.slash_evidence,
+                st.slash_targets,
             )
             .await?;
             // After the blocks are in, never before: the caches are keyed by
@@ -1235,6 +1236,8 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
         start_block: BlockMessage,
         min_height: i64,
         height_map: BTreeMap<i64, HashSet<BlockHash>>,
+        slash_evidence: HashSet<BlockHash>,
+        slash_targets: HashSet<BlockHash>,
     ) -> Result<(), CasperError> {
         async fn add_block_to_dag<T: TransportLayer + Send + Sync + Clone>(
             initializing: &Initializing<T>,
@@ -1271,12 +1274,26 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
             .map(|bond| bond.validator.to_vec())
             .collect();
 
-        let invalid_blocks: HashSet<ByteString> = start_block
+        let mut invalid_blocks: HashSet<ByteString> = start_block
             .justifications
             .iter()
             .filter(|justification| slashed_validators.contains(&justification.validator.to_vec()))
             .map(|justification| justification.latest_block_hash.to_vec())
             .collect();
+        invalid_blocks.extend(slash_targets.into_iter().map(|hash| hash.to_vec()));
+
+        for hash in slash_evidence {
+            let block = self.block_store.get(&hash)?.ok_or_else(|| {
+                CasperError::RuntimeError(format!(
+                    "Slash evidence {} missing from block store during DAG population",
+                    PrettyPrinter::build_string_bytes(&hash)
+                ))
+            })?;
+            self.block_dag_storage.insert(
+                &block,
+                block_storage::rust::dag::block_dag_key_value_storage::InsertMode::SlashEvidence,
+            )?;
+        }
 
         let mut inserted = 0usize;
 
@@ -1370,7 +1387,12 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
         // Get all blocks in the DAG that need replay (from minBlockNumber to LFB)
         // We process in topological order (by block number, then by hash for determinism)
         let all_blocks = dag.topo_sort(min_block_number, None)?;
-        let blocks_to_replay: Vec<BlockHash> = all_blocks.into_iter().flatten().collect();
+        let invalid_blocks = dag.invalid_blocks_map()?;
+        let blocks_to_replay: Vec<BlockHash> = all_blocks
+            .into_iter()
+            .flatten()
+            .filter(|hash| !invalid_blocks.contains_key(hash))
+            .collect();
 
         tracing::info!(
             "Found {} blocks in range for mergeable channel cache check.",
@@ -1792,44 +1814,6 @@ impl<T: TransportLayer + Send + Sync> BlockRequesterOps for BlockRequesterWrappe
     }
 
     fn validate_block(&self, block: &BlockMessage) -> bool { (self.validate_block_fn)(block) }
-
-    async fn request_for_mergeable_entry(&self, block_hash: &BlockHash) -> Result<(), CasperError> {
-        let req = MergeableEntryRequest {
-            block_hash: block_hash.clone(),
-        };
-        self.transport_layer
-            .send_message_to_peers(
-                self.connections_cell,
-                self.rp_conf_ask,
-                Arc::new(req.to_proto()),
-                None,
-            )
-            .await
-            .map_err(|e| CasperError::RuntimeError(e.to_string()))?;
-        Ok(())
-    }
-
-    fn put_mergeable_entry(
-        &self,
-        block_hash: &BlockHash,
-        serialized_entry: &[u8],
-    ) -> Result<(), CasperError> {
-        if serialized_entry.is_empty() {
-            return Ok(());
-        }
-        // Look up the block to compute the local mergeable_key (must match
-        // the server's key exactly; both sides derive it from the block's
-        // post_state/sender/seq).
-        let block = self.block_store.get_unsafe(block_hash);
-        let key_bytes = RuntimeManager::mergeable_key_bytes_for_block(&block)?;
-        let runtime_manager = self.runtime_manager.as_ref().ok_or_else(|| {
-            CasperError::RuntimeError(
-                "BlockRequesterWrapper missing runtime_manager (mergeable-entry import)"
-                    .to_string(),
-            )
-        })?;
-        runtime_manager.put_mergeable_entry_bytes(key_bytes, serialized_entry.to_vec())
-    }
 }
 
 /// Wrapper struct for block request operations
@@ -1839,10 +1823,6 @@ pub struct BlockRequesterWrapper<'a, T: TransportLayer> {
     rp_conf_ask: &'a RPConf,
     block_store: KeyValueBlockStore,
     validate_block_fn: Box<dyn Fn(&BlockMessage) -> bool + Send + Sync + 'a>,
-    /// Optional runtime_manager handle for the mergeable-channels store
-    /// import path. Required in production; optional for tests that don't
-    /// exercise the mergeable path.
-    runtime_manager: Option<Arc<RuntimeManager>>,
 }
 
 impl<'a, T: TransportLayer> BlockRequesterWrapper<'a, T> {
@@ -1859,15 +1839,7 @@ impl<'a, T: TransportLayer> BlockRequesterWrapper<'a, T> {
             rp_conf_ask,
             block_store,
             validate_block_fn,
-            runtime_manager: None,
         }
-    }
-
-    /// Attach a `RuntimeManager` so the wrapper can import mergeable-channel
-    /// entries.
-    pub fn with_runtime_manager(mut self, runtime_manager: Arc<RuntimeManager>) -> Self {
-        self.runtime_manager = Some(runtime_manager);
-        self
     }
 }
 

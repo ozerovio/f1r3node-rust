@@ -373,6 +373,8 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> CasperLaunchImpl<T> {
                                 "Pendant {} does not match its hash or signature. Skipped.",
                                 PrettyPrinter::build_string_bytes(&hash)
                             );
+                            casper_buffer_storage.remove(BlockHashSerde(hash.clone()))?;
+                            block_retriever.forget_hash_tracking(&hash)?;
                             continue;
                         }
                     };
