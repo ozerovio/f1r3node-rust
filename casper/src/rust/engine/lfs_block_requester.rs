@@ -572,9 +572,6 @@ impl<'a, T: BlockRequesterOps> StreamProcessor<'a, T> {
             );
         }
 
-        // Block-side done. Mergeable-channel entries are not requested from
-        // peers: nothing can verify a remote entry, so the replay after the
-        // sync rebuilds every entry locally.
         let state_update_start = std::time::Instant::now();
         {
             let mut state = self.st.lock().map_err(|_| {
@@ -1212,7 +1209,194 @@ async fn create_stream_with_processor<'a, T: BlockRequesterOps>(
 
 #[cfg(test)]
 mod window_tests {
+    use crypto::rust::signatures::secp256k1::Secp256k1;
+    use crypto::rust::signatures::signatures_alg::SignaturesAlg;
+    use models::rust::block_implicits::get_random_block;
+    use models::rust::casper::protocol::casper_message::Justification;
+
     use super::*;
+    use crate::rust::validate::Validate;
+    use crate::rust::validator_identity::ValidatorIdentity;
+
+    #[derive(Default)]
+    struct ProgressBlockOps {
+        blocks: HashMap<BlockHash, BlockMessage>,
+        requests: Mutex<Vec<BlockHash>>,
+    }
+
+    #[async_trait]
+    impl BlockRequesterOps for ProgressBlockOps {
+        async fn request_for_block(&self, block_hash: &BlockHash) -> Result<(), CasperError> {
+            self.requests.lock().unwrap().push(block_hash.clone());
+            Ok(())
+        }
+
+        fn contains_block(&self, block_hash: &BlockHash) -> Result<bool, CasperError> {
+            Ok(self.blocks.contains_key(block_hash))
+        }
+
+        fn get_block_from_store(&self, block_hash: &BlockHash) -> BlockMessage {
+            self.blocks.get(block_hash).expect("stored block").clone()
+        }
+
+        fn put_block_to_store(
+            &mut self,
+            block_hash: BlockHash,
+            block: &BlockMessage,
+        ) -> Result<(), CasperError> {
+            self.blocks.insert(block_hash, block.clone());
+            Ok(())
+        }
+
+        fn validate_block(&self, block: &BlockMessage) -> bool { Validate::historical_block(block) }
+    }
+
+    fn signed_block_below_window() -> BlockMessage {
+        let (secret_key, _) = Secp256k1.new_key_pair();
+        let block = get_random_block(
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![hash(0xaa)]),
+            Some(vec![Justification {
+                validator: Validator::from(vec![0xbb; 65]),
+                latest_block_hash: hash(0xcc),
+            }]),
+            Some(vec![]),
+            Some(vec![]),
+            None,
+            None,
+            None,
+        );
+        ValidatorIdentity::new(&secret_key).sign_block(&block)
+    }
+
+    #[tokio::test]
+    async fn requested_block_below_window_is_saved_and_reports_progress_without_expanding_dependencies(
+    ) {
+        let block = signed_block_below_window();
+        let mut ops = ProgressBlockOps::default();
+        let state = ST::new(HashSet::from([block.block_hash.clone()]), None, Some(10));
+        let (state, _) = state.get_next(false);
+        let state = Arc::new(Mutex::new(state));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut processor = StreamProcessor::new(&mut ops, state.clone(), HashMap::new(), sender);
+
+        assert!(processor.process_block(&block).await.unwrap());
+        assert!(!processor.process_block(&block).await.unwrap());
+        assert_eq!(
+            processor.requester.blocks.get(&block.block_hash),
+            Some(&block)
+        );
+        assert_eq!(processor.requester.blocks.len(), 1);
+        assert!(processor.requester.requests.lock().unwrap().is_empty());
+        assert!(receiver.try_recv().is_err());
+        let state = state.lock().unwrap();
+        assert!(state.is_finished());
+        assert_eq!(state.finished, HashSet::from([block.block_hash]));
+        assert_eq!(state.lower_bound, 10);
+    }
+
+    #[tokio::test]
+    async fn invalid_requested_copies_do_not_report_progress_or_prevent_the_original_from_completing(
+    ) {
+        let block = signed_block_below_window();
+        let mut invalid_hash = block.clone();
+        invalid_hash.header.timestamp ^= 1;
+        let mut invalid_signature = block.clone();
+        invalid_signature.sig = Default::default();
+        let mut ops = ProgressBlockOps::default();
+        let state = ST::new(HashSet::from([block.block_hash.clone()]), None, Some(10));
+        let (state, _) = state.get_next(false);
+        let state = Arc::new(Mutex::new(state));
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut processor = StreamProcessor::new(&mut ops, state.clone(), HashMap::new(), sender);
+
+        for invalid in [invalid_hash, invalid_signature] {
+            assert!(!processor.process_block(&invalid).await.unwrap());
+            assert!(processor.requester.blocks.is_empty());
+            let state = state.lock().unwrap();
+            assert_eq!(state.d.get(&block.block_hash), Some(&ReqStatus::Requested));
+            assert!(state.finished.is_empty());
+            assert!(state.height_map.is_empty());
+            assert!(!state.is_finished());
+        }
+
+        assert!(processor.process_block(&block).await.unwrap());
+        assert_eq!(
+            processor.requester.blocks.get(&block.block_hash),
+            Some(&block)
+        );
+        assert!(processor.requester.requests.lock().unwrap().is_empty());
+        assert!(state.lock().unwrap().is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_valid_requested_blocks_below_window_reset_the_idle_timeout() {
+        use futures::{FutureExt, StreamExt};
+
+        for valid in [true, false] {
+            let mut block = signed_block_below_window();
+            let remaining = hash(0xdd);
+            let state = ST::new(
+                HashSet::from([block.block_hash.clone(), remaining.clone()]),
+                None,
+                Some(10),
+            );
+            let (state, _) = state.get_next(false);
+            let state = Arc::new(Mutex::new(state));
+            let mut ops = ProgressBlockOps::default();
+            let (request_tx, request_rx) = mpsc::channel(2);
+            let (hash_tx, hash_rx) = mpsc::channel(1);
+            let (message_tx, message_rx) = mpsc::channel(1);
+            let (_mergeable_tx, mergeable_rx) = mpsc::channel(1);
+            let initial = VecDeque::new();
+            let processor = StreamProcessor::new(&mut ops, state, HashMap::new(), hash_tx);
+            let stream = create_stream_with_processor(
+                processor,
+                request_rx,
+                request_tx,
+                hash_rx,
+                &initial,
+                message_rx,
+                Arc::new(AtomicUsize::new(1)),
+                mergeable_rx,
+                Duration::from_secs(10),
+                Duration::from_secs(40),
+            )
+            .await
+            .unwrap();
+            futures::pin_mut!(stream);
+            assert!(stream.next().now_or_never().is_none());
+            tokio::time::advance(Duration::from_secs(8)).await;
+            if !valid {
+                block.sig = Default::default();
+            }
+            message_tx.send(block.clone()).await.unwrap();
+            let received = stream.next().await.unwrap();
+            assert_eq!(received.finished.contains(&block.block_hash), valid);
+
+            tokio::time::advance(Duration::from_secs(3)).await;
+            let retry = stream.next().now_or_never();
+            if valid {
+                assert!(retry.is_none(), "valid response must postpone the retry");
+                tokio::time::advance(Duration::from_secs(7)).await;
+                let retry = stream.next().await.unwrap();
+                assert_eq!(retry.d.len(), 1);
+                assert_eq!(retry.d.get(&remaining), Some(&ReqStatus::Requested));
+            } else {
+                let retry = retry
+                    .expect("invalid response must not postpone the retry")
+                    .unwrap();
+                assert_eq!(retry.d.len(), 2);
+                assert!(retry.finished.is_empty());
+            }
+        }
+    }
 
     fn hash(byte: u8) -> BlockHash { BlockHash::from(vec![byte; 32]) }
 

@@ -69,7 +69,7 @@ async fn verify_buffer_pendant<T: TransportLayer + Send + Sync + 'static>(
                 ?error,
                 "Removing dependency-free pendant with invalid hash or signature"
             );
-            processor.purge_from_buffer_and_ack(pendant).await?;
+            processor.discard_corrupt_pendant(pendant).await?;
             Ok(None)
         }
     }
@@ -1000,6 +1000,149 @@ mod tests {
             assert!(!buffer.contains(&BlockHashSerde(hash.clone())));
             assert!(!retriever.is_received(hash).await.unwrap());
             assert_eq!(retriever.get_requested_blocks_count().await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_parent_copy_keeps_its_children_waiting_for_the_correct_original() {
+        use std::collections::HashSet;
+
+        use block_storage::rust::dag::block_dag_key_value_storage::InsertMode;
+        use models::rust::block_hash::BlockHashSerde;
+
+        let identity =
+            ValidatorIdentity::new(&crypto::rust::private_key::PrivateKey::from_bytes(&[1; 32]));
+        for corrupt_hash in [true, false] {
+            for replaced_before_cleanup in [false, true] {
+                let mut stores = InMemoryStoreManager::new();
+                let block_store = KeyValueBlockStore::create_from_kvm(&mut stores)
+                    .await
+                    .unwrap();
+                let buffer = CasperBufferKeyValueStorage::new_from_kvm(&mut stores)
+                    .await
+                    .unwrap();
+                let dag = BlockDagKeyValueStorage::new(&mut stores).await.unwrap();
+                let local = PeerNode::new(
+                    NodeIdentifier {
+                        key: vec![1; 20].into(),
+                    },
+                    "localhost".to_string(),
+                    40400,
+                    40404,
+                );
+                let conf = create_rp_conf_ask(local, None, None);
+                let transport = Arc::new(TransportLayerStub::new());
+                let connections = ConnectionsCell::new();
+                let retriever = BlockRetriever::new(
+                    Arc::new(Mutex::new(HashMap::new())),
+                    transport.clone(),
+                    connections.clone(),
+                    conf.clone(),
+                );
+                let processor = BlockProcessor::new(BlockProcessorDependencies::new(
+                    block_store.clone(),
+                    buffer.clone(),
+                    dag.clone(),
+                    retriever.clone(),
+                    transport,
+                    connections,
+                    conf,
+                    None,
+                ));
+                let mut unsigned = get_random_block_default();
+                unsigned.header.parents_hash_list.clear();
+                unsigned.justifications.clear();
+                unsigned.body.system_deploys.clear();
+                unsigned.body.state.bonds.clear();
+                unsigned.body.state.block_number = 1;
+                let parent = identity.sign_block(&unsigned);
+                unsigned.header.parents_hash_list = vec![parent.block_hash.clone()];
+                unsigned.body.state.block_number = 2;
+                unsigned.seq_num += 1;
+                let child = identity.sign_block(&unsigned);
+                let parent_hash = BlockHashSerde(parent.block_hash.clone());
+                let child_hash = BlockHashSerde(child.block_hash.clone());
+                let mut bad_copy = parent.clone();
+                if corrupt_hash {
+                    bad_copy.extra_bytes = Bytes::from_static(b"changed after signing");
+                } else {
+                    bad_copy.sig = Bytes::new();
+                }
+                block_store.put_block_message(&bad_copy).unwrap();
+                block_store.put_block_message(&child).unwrap();
+                buffer.put_pendant(parent_hash.clone()).unwrap();
+                buffer
+                    .add_relation(parent_hash.clone(), child_hash.clone())
+                    .unwrap();
+                retriever
+                    .ack_receive(parent.block_hash.clone())
+                    .await
+                    .unwrap();
+
+                if replaced_before_cleanup {
+                    block_store.put_block_message(&parent).unwrap();
+                }
+
+                assert!(super::verify_buffer_pendant(&processor, &bad_copy)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    buffer.get_parents(&child_hash),
+                    Some(HashSet::from([parent_hash.clone()]))
+                );
+                assert!(!buffer.is_pendant(&child_hash));
+                assert!(buffer.requested_as_dependency(&parent_hash));
+                if replaced_before_cleanup {
+                    assert!(buffer.is_pendant(&parent_hash));
+                    assert_eq!(
+                        block_store.get(&parent.block_hash).unwrap(),
+                        Some(parent.clone())
+                    );
+                    assert!(retriever
+                        .is_received(parent.block_hash.clone())
+                        .await
+                        .unwrap());
+                } else {
+                    assert!(!buffer.contains(&parent_hash));
+                    assert!(block_store.get(&parent.block_hash).unwrap().is_none());
+                    assert!(retriever.awaits_block(&parent.block_hash));
+                    assert!(!retriever
+                        .is_received(parent.block_hash.clone())
+                        .await
+                        .unwrap());
+                }
+                assert!(!dag
+                    .get_representation()
+                    .unwrap()
+                    .contains(&parent.block_hash));
+
+                let restored_buffer = CasperBufferKeyValueStorage::new_from_kvm(&mut stores)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    restored_buffer.get_parents(&child_hash),
+                    Some(HashSet::from([parent_hash.clone()]))
+                );
+                assert!(!restored_buffer.is_pendant(&child_hash));
+
+                let verified = super::verify_buffer_pendant(&processor, &parent)
+                    .await
+                    .unwrap()
+                    .expect("correct original accepted");
+                block_store.put_block_message(&verified).unwrap();
+                dag.insert(&verified, InsertMode::Normal).unwrap();
+                buffer.remove(parent_hash).unwrap();
+                assert!(buffer.is_pendant(&child_hash));
+                assert!(dag
+                    .get_representation()
+                    .unwrap()
+                    .contains(&parent.block_hash));
+                assert!(super::verify_buffer_pendant(&processor, &child)
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
         }
     }
 

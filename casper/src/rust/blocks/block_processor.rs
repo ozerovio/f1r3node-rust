@@ -354,6 +354,35 @@ pub fn mark_in_flight(blocks: &Arc<InFlightBlocks>, hash: BlockHash) -> InFlight
 #[derive(Debug, Clone)]
 pub struct VerifiedBlock(BlockMessage);
 
+pub async fn discard_corrupt_pendant<T: TransportLayer + Send + Sync>(
+    block: &BlockMessage,
+    store: &KeyValueBlockStore,
+    buffer: &CasperBufferKeyValueStorage,
+    retriever: &BlockRetriever<T>,
+) -> Result<(), CasperError> {
+    if !store.remove_if_matches(block)?
+        && store
+            .get(&block.block_hash)?
+            .is_some_and(|current| current != *block)
+    {
+        return Ok(());
+    }
+    store.discard_pending(&block.block_hash);
+    let needed =
+        buffer.discard_copy_preserving_dependents(BlockHashSerde(block.block_hash.clone()))?;
+    retriever.forget_hash_tracking(&block.block_hash)?;
+    if needed {
+        retriever
+            .admit_hash(
+                block.block_hash.clone(),
+                None,
+                AdmitHashReason::MissingDependencyRequested,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 impl VerifiedBlock {
     pub fn verify(block: BlockMessage) -> Result<Self, InvalidBlock> {
         Validate::block_hash_and_signature(&block)?;
@@ -1178,6 +1207,21 @@ impl<T: TransportLayer + Send + Sync + 'static> BlockProcessor<T> {
     pub async fn purge_from_buffer_and_ack(&self, block: &BlockMessage) -> Result<(), CasperError> {
         self.dependencies.remove_from_buffer(block).await?;
         self.dependencies.ack_processed(block).await
+    }
+
+    pub async fn discard_corrupt_pendant(&self, block: &BlockMessage) -> Result<(), CasperError> {
+        discard_corrupt_pendant(
+            block,
+            &self.dependencies.block_store,
+            &self.dependencies.casper_buffer,
+            &self.dependencies.block_retriever,
+        )
+        .await?;
+        self.dependencies
+            .clear_missing_dependency_attempts(&block.block_hash)?;
+        self.dependencies
+            .clear_missing_dependency_quarantine(&block.block_hash)?;
+        Ok(())
     }
 
     /// See [`BlockProcessorDependencies::note_validation_failure`].
@@ -2589,6 +2633,41 @@ mod tests {
             .count()
     }
 
+    async fn hold_verification(
+        verifier: Arc<ReceiptVerifier>,
+        peer: prost::bytes::Bytes,
+        block: BlockMessage,
+    ) -> (
+        tokio::task::JoinHandle<Result<VerifiedBlock, ReceiptRefusal>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            verifier
+                .verify_with(&peer, block, move |block| {
+                    started_tx.send(()).expect("verification started");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("release verification");
+                    VerifiedBlock::verify(block)
+                })
+                .await
+        });
+        started_rx.await.expect("verification started");
+        (task, release_tx)
+    }
+
+    async fn wait_for_pending_permits(verifier: &ReceiptVerifier, available: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while verifier.pending.available_permits() != available {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending verification state");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn receipt_verification_stays_bounded_under_a_flood_of_invalid_blocks() {
         use crypto::rust::signatures::secp256k1::Secp256k1;
@@ -2603,41 +2682,114 @@ mod tests {
         let invalid_hash = ReceiptRefusal::Invalid(InvalidBlock::InvalidBlockHash);
 
         let single_peer = Arc::new(ReceiptVerifier::new(2, 512, 16));
-        let results = flood(
+        let (first, release) =
+            hold_verification(single_peer.clone(), attacker.clone(), large.clone()).await;
+        let waiters: Vec<_> = (0..15)
+            .map(|_| {
+                let verifier = single_peer.clone();
+                let peer = attacker.clone();
+                let block = large.clone();
+                tokio::spawn(async move { verifier.verify(&peer, block).await })
+            })
+            .collect();
+        wait_for_pending_permits(&single_peer, 496).await;
+        let mut results = flood(
             single_peer.clone(),
-            (0..200)
+            (0..184)
                 .map(|_| (attacker.clone(), large.clone()))
                 .collect(),
         )
         .await;
+        release.send(()).expect("release first check");
+        results.push(first.await.expect("first check"));
+        for waiter in waiters {
+            results.push(waiter.await.expect("pending check"));
+        }
         let overloaded = count(&results, ReceiptRefusal::Overloaded);
-        assert!(overloaded > 0);
+        assert_eq!(overloaded, 184);
         assert_eq!(overloaded + count(&results, invalid_hash.clone()), 200);
         assert_eq!(single_peer.peak_active(), 1);
         assert_eq!(single_peer.tracked_peers(), 0);
 
         let small_global = Arc::new(ReceiptVerifier::new(2, 8, 16));
-        let results = flood(
+        let (first, release_first) = hold_verification(
             small_global.clone(),
-            (0..50u8)
+            prost::bytes::Bytes::from_static(b"first"),
+            large.clone(),
+        )
+        .await;
+        let (second, release_second) = hold_verification(
+            small_global.clone(),
+            prost::bytes::Bytes::from_static(b"second"),
+            large.clone(),
+        )
+        .await;
+        let waiters: Vec<_> = (0..6u8)
+            .map(|i| {
+                let verifier = small_global.clone();
+                let block = large.clone();
+                tokio::spawn(async move {
+                    verifier
+                        .verify(&prost::bytes::Bytes::from(vec![i; 20]), block)
+                        .await
+                })
+            })
+            .collect();
+        wait_for_pending_permits(&small_global, 0).await;
+        let mut results = flood(
+            small_global.clone(),
+            (20..62u8)
                 .map(|i| (prost::bytes::Bytes::from(vec![i; 20]), large.clone()))
                 .collect(),
         )
         .await;
-        assert!(count(&results, ReceiptRefusal::Overloaded) > 0);
+        release_first.send(()).expect("release first check");
+        release_second.send(()).expect("release second check");
+        results.push(first.await.expect("first check"));
+        results.push(second.await.expect("second check"));
+        for waiter in waiters {
+            results.push(waiter.await.expect("pending check"));
+        }
+        assert_eq!(count(&results, ReceiptRefusal::Overloaded), 42);
+        assert_eq!(results.len(), 50);
         assert!(small_global.peak_active() <= 2);
         assert_eq!(small_global.tracked_peers(), 0);
 
         let (secret_key, _) = Secp256k1.new_key_pair();
         let honest = ValidatorIdentity::new(&secret_key).sign_block(&get_random_block_default());
-        let mut submissions: Vec<_> = (0..200)
-            .map(|_| (attacker.clone(), large.clone()))
-            .collect();
-        submissions
-            .extend((0..8u8).map(|i| (prost::bytes::Bytes::from(vec![i; 20]), honest.clone())));
-
         let mixed = Arc::new(ReceiptVerifier::new(2, 512, 16));
-        let results = flood(mixed.clone(), submissions).await;
+        let (first, release) =
+            hold_verification(mixed.clone(), attacker.clone(), large.clone()).await;
+        let waiters: Vec<_> = (0..15)
+            .map(|_| {
+                let verifier = mixed.clone();
+                let peer = attacker.clone();
+                let block = large.clone();
+                tokio::spawn(async move { verifier.verify(&peer, block).await })
+            })
+            .collect();
+        wait_for_pending_permits(&mixed, 496).await;
+        let mut results = flood(
+            mixed.clone(),
+            (0..8u8)
+                .map(|i| (prost::bytes::Bytes::from(vec![i; 20]), honest.clone()))
+                .collect(),
+        )
+        .await;
+        results.extend(
+            flood(
+                mixed.clone(),
+                (0..184)
+                    .map(|_| (attacker.clone(), large.clone()))
+                    .collect(),
+            )
+            .await,
+        );
+        release.send(()).expect("release first check");
+        results.push(first.await.expect("first check"));
+        for waiter in waiters {
+            results.push(waiter.await.expect("pending check"));
+        }
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 8);
         assert!(mixed.peak_active() <= 2);
         assert_eq!(mixed.tracked_peers(), 0);
@@ -2766,30 +2918,12 @@ mod tests {
 
         let verifier = Arc::new(ReceiptVerifier::new(1, 8, 8));
         let block = get_random_block_default();
-        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-
-        let first = {
-            let verifier = verifier.clone();
-            let block = block.clone();
-            tokio::spawn(async move {
-                verifier
-                    .verify_with(
-                        &prost::bytes::Bytes::from_static(b"first"),
-                        block,
-                        move |block| {
-                            started_tx.send(()).expect("start signal");
-                            release_rx.recv().expect("release signal");
-                            VerifiedBlock::verify(block)
-                        },
-                    )
-                    .await
-            })
-        };
-        tokio::task::spawn_blocking(move || started_rx.recv())
-            .await
-            .expect("join")
-            .expect("first check started");
+        let (first, release_tx) = hold_verification(
+            verifier.clone(),
+            prost::bytes::Bytes::from_static(b"first"),
+            block.clone(),
+        )
+        .await;
         first.abort();
         assert!(first
             .await
@@ -2804,7 +2938,8 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        wait_for_pending_permits(&verifier, 6).await;
+        assert_eq!(verifier.running.available_permits(), 0);
         assert!(!second.is_finished());
 
         release_tx.send(()).expect("release first check");

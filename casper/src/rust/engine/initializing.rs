@@ -1059,9 +1059,6 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
         // stored post-state so `RuntimeManager::load_mergeable_channels`
         // succeeds during validation.
         //
-        // The sync does not import mergeable entries from peers: nothing can
-        // verify a remote entry. This replay builds every missing entry
-        // locally and checks each block against its recorded post-state.
         // Bounded by the state floor, not the block floor: the replay executes
         // blocks, so it must not walk below the history the horizon sync just
         // imported, and a block below the parent reach is never merged on.
@@ -1333,11 +1330,6 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
     /// This is necessary for multi-parent block validation, which requires mergeable
     /// channel data from parent blocks to compute merged state.
     ///
-    /// The LFS sync transfers the RSpace trie but not the mergeable channel store,
-    /// and it does not import entries from peers, because nothing can verify a
-    /// remote entry. So this function builds every entry that this node did not
-    /// compute itself.
-    ///
     /// Before this fix, this loop replayed EVERY block from `min_block_number`
     /// to the LFB unconditionally, regardless of whether its cache entry was
     /// already present. With `disable-lfs=true` (or any join where
@@ -1399,8 +1391,6 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
             blocks_to_replay.len()
         );
 
-        // Replay each block to populate mergeable channels, skipping any block
-        // whose entry this node already computed.
         let mut skipped = 0usize;
         let mut replayed = 0usize;
         for block_hash in blocks_to_replay {
@@ -1523,8 +1513,6 @@ impl<T: TransportLayer + Send + Sync + Clone> Initializing<T> {
         let block_data = rholang::rust::interpreter::system_processes::BlockData::from_block(block);
         let is_genesis = parents.is_empty();
 
-        // The same invalid-blocks map that block creation and validation used:
-        // the block's own slash targets, not this node's DAG invalid set.
         let dag = self.block_dag_storage.get_representation()?;
         let invalid_blocks_map = proto_util::block_slash_invalid_blocks(&dag, block)?;
 
