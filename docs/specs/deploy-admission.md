@@ -25,6 +25,13 @@ Missing own blocks do not create samples or cause time-based decay.
 
 With samples, capacity is `min(3 * shard_cap, floor(3 * sum(inclusions) / sample_count))`.
 Without samples, capacity is `3 * min(8, shard_cap)`.
+The following recovery rule can raise this baseline without adding drained blocks to the sample window.
+Let `B` be the larger of the baseline and recovery budgets before the configured block-limit clamp.
+For a drained block with `I` actual first inclusions, update recovery only if `3 * I > B`.
+Set the recovery budget to `min(3 * I, B + max(1, ceil(B / 3)))`, using saturating arithmetic.
+Capacity is the larger budget, capped at `3 * shard_cap`.
+A block with remaining eligible demand clears recovery before updating the eight-sample window.
+Repeated sequences, older sequences, and idle blocks cannot increase recovery.
 For zero measured capacity and an empty fresh queue, allow one probe if the shard cap is positive.
 A zero shard cap always disables admission.
 Accept a fresh candidate only when occupancy is below capacity.

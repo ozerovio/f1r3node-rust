@@ -14,6 +14,10 @@ The estimate does not guarantee execution when service or consensus conditions c
 Before the first sample, capacity is `3 * min(8, shard_cap)`.
 Idle blocks do not reduce capacity.
 Blocks that drain eligible work do not reduce capacity.
+Their actual inclusions can support a gradual increase without entering the sample window.
+Each increase is at most one currently estimated block, rounded up, with a minimum step of one.
+An increased budget cannot exceed three times the observed inclusion count or three configured block limits.
+A new sample with remaining eligible demand clears this recovery budget and uses the existing sample window.
 Future deploys alone do not establish eligible demand.
 A block with eligible demand and no first inclusion contributes zero.
 A zero estimate permits one probe after fresh pending work drains, if the shard cap is positive.
