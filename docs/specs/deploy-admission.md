@@ -13,6 +13,8 @@ The proposer retains `(valid_after_block_number, time_stamp, sig)` selection ord
 
 Keep at most eight demand samples from accepted local blocks, in sender sequence order.
 Sample only blocks that leave fresh local work eligible for that block waiting after their first inclusions.
+Capture eligible candidates during block selection. Count their actual inclusions after successful local proposal acceptance.
+Do not sample the pool at insertion time or count arrivals after selection.
 Future entries alone do not qualify a block for sampling.
 Ignore repeated or older sequences, peer blocks, idle blocks, and failed proposals.
 Count distinct first inclusions of fresh local signatures, including failed executions.

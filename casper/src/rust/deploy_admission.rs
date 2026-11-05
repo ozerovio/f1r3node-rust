@@ -17,6 +17,12 @@ struct ServiceSamples {
     last_sequence: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct LocalServiceSample {
+    pub included: usize,
+    pub has_remaining_demand: bool,
+}
+
 #[derive(Default)]
 pub struct DeployAdmission {
     samples: parking_lot::Mutex<ServiceSamples>,
@@ -39,6 +45,22 @@ pub(crate) struct ReservationCache {
 }
 
 impl DeployAdmission {
+    pub(crate) fn log_pool_busy(&self, capacity: usize, pending_ahead: usize, occupied: usize) {
+        if !tracing::enabled!(target: "f1r3fly.casper.deploy_admission", tracing::Level::DEBUG) {
+            return;
+        }
+        let samples = self.samples.lock();
+        tracing::debug!(
+            target: "f1r3fly.casper.deploy_admission",
+            capacity,
+            pending_ahead,
+            occupied,
+            latest_samples = ?samples.inclusions,
+            latest_sequence = ?samples.last_sequence,
+            "Deploy pool busy"
+        );
+    }
+
     pub(crate) fn observe(&self, sequence: i32, included: usize, has_remaining_demand: bool) {
         let mut samples = self.samples.lock();
         if samples.last_sequence.is_some_and(|last| sequence <= last) {

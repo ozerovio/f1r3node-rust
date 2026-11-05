@@ -7,6 +7,7 @@ Its total size therefore does not measure fresh pending work.
 Admission bounds all fresh pending signatures, including future deploys.
 An earlier timestamp cannot bypass a full queue.
 An eight-sample window measures first inclusions in accepted local blocks that leave fresh, eligible work waiting.
+Each sample uses the block's selection candidates. Arrivals after selection do not count as unserved demand for that block.
 Three blocks of measured inclusion capacity define the queue budget.
 The estimate does not guarantee execution when service or consensus conditions change.
 

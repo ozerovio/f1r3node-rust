@@ -22,6 +22,7 @@ Duplicate checks keep priority over full-queue errors.
 Incompatible pool, rejected-buffer, DAG, or reservation changes during all three attempts produce a retryable refusal without saving the candidate.
 Terminal progress alone does not restart an attempt. Its permanent exclusions can only reduce the fresh queue.
 Only local blocks with remaining eligible demand contribute service samples.
+Samples use selection-time candidates and actual inclusions. Later arrivals do not change the sample.
 New arrivals have a three-height horizon beyond the next block. Previously accepted future entries retain their queue positions.
 Verified-record reuse preserves consistent metadata and the existing quarantine rules.
 
