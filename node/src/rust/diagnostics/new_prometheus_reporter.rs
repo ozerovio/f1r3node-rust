@@ -83,10 +83,7 @@ impl NewPrometheusReporter {
             return Ok(Arc::clone(reporter));
         }
 
-        let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        let recorder = prometheus_builder
-            .set_buckets(&config.default_buckets)?
-            .build_recorder();
+        let recorder = config.build_recorder()?;
 
         let handle = recorder.handle();
 
